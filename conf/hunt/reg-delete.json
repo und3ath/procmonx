@@ -1,0 +1,12 @@
+{
+  "_desc": "RegDeleteKey/RegDeleteValue by a privileged process: arbitrary-registry-delete. Restricted to High/System/Protected integrity callers (LPE-relevant).",
+  "filters": [
+    { "column": "Class", "relation": "isNot", "value": "Registry", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "RegDeleteKey", "action": "include" },
+    { "column": "Operation", "relation": "is", "value": "RegDeleteValue", "action": "include" },
+    { "column": "Integrity", "relation": "is", "value": "Medium", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Medium+", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Low", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Untrusted", "action": "exclude" }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "_desc": "SetRenameInformationFile (move) by a privileged process: arbitrary-move / overwrite. Restricted to High/System/Protected integrity callers (LPE-relevant).",
+  "filters": [
+    { "column": "Class", "relation": "isNot", "value": "FileSystem", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "SetRenameInformationFile", "action": "include" },
+    { "column": "Integrity", "relation": "is", "value": "Medium", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Medium+", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Low", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Untrusted", "action": "exclude" }
+  ]
+}

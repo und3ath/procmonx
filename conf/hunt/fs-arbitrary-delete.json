@@ -1,0 +1,11 @@
+{
+  "_desc": "SetDispositionInformationFile (delete) by a privileged process: arbitrary-delete primitive. Restricted to High/System/Protected integrity callers (LPE-relevant).",
+  "filters": [
+    { "column": "Class", "relation": "isNot", "value": "FileSystem", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "SetDispositionInformationFile", "action": "include" },
+    { "column": "Integrity", "relation": "is", "value": "Medium", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Medium+", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Low", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Untrusted", "action": "exclude" }
+  ]
+}

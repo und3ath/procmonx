@@ -1,0 +1,13 @@
+{
+  "_desc": "RegLoadKey/RegRestoreKey/RegReplaceKey from a file by a privileged process: hive-load LPE. Restricted to High/System/Protected integrity callers (LPE-relevant).",
+  "filters": [
+    { "column": "Class", "relation": "isNot", "value": "Registry", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "RegLoadKey", "action": "include" },
+    { "column": "Operation", "relation": "is", "value": "RegRestoreKey", "action": "include" },
+    { "column": "Operation", "relation": "is", "value": "RegReplaceKey", "action": "include" },
+    { "column": "Integrity", "relation": "is", "value": "Medium", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Medium+", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Low", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Untrusted", "action": "exclude" }
+  ]
+}

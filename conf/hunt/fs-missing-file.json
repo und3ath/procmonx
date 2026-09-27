@@ -1,0 +1,13 @@
+{
+  "_desc": "Any missing file open (config/exe/manifest/.db) by a privileged process: plant-a-file redirection. Restricted to High/System/Protected integrity callers (LPE-relevant).",
+  "filters": [
+    { "column": "Class", "relation": "isNot", "value": "FileSystem", "action": "exclude" },
+    { "column": "Result", "relation": "is", "value": "NAME_NOT_FOUND", "action": "include" },
+    { "column": "Result", "relation": "is", "value": "NO_SUCH_FILE", "action": "include" },
+    { "column": "Result", "relation": "is", "value": "PATH_NOT_FOUND", "action": "include" },
+    { "column": "Integrity", "relation": "is", "value": "Medium", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Medium+", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Low", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Untrusted", "action": "exclude" }
+  ]
+}

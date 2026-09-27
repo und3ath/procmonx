@@ -1,0 +1,69 @@
+#pragma once
+// Shared CLI infrastructure: console/file output, UTF-8 conversion, error
+// reporting, and the filter-argument plumbing used by the live / open / summary
+// commands.
+
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <vector>
+
+#include "pmx/event.h"
+#include "pmx/filter.h"
+
+namespace pmx::cli {
+
+// ---- Output -----------------------------------------------------------------
+// By default output goes to the console; --out FILE also mirrors it to a file
+// (tee), and --silent suppresses the console (file only). With --json - the
+// console stream carries JSON Lines only, so status lines go to stderr instead.
+extern std::FILE* g_outFile;   // --out target, or null
+extern bool g_silent;          // --silent: no console
+extern bool g_jsonStdout;      // --json -: stdout is JSON Lines
+extern bool g_noPause;         // --no-pause: elevated window closes on exit
+
+void writeOut(const char* s, size_t n);
+void outf(const char* fmt, ...);        // console/file stream
+void errf(const char* fmt, ...);        // stderr (never silenced, not tee'd)
+void statusf(const char* fmt, ...);     // outf, or stderr under --json -
+void writeJsonRow(const pmx::Event& ev);
+void printError(const char* what, std::error_code ec);
+
+// Convert `len` wchars (or -1 for a NUL-terminated string) to UTF-8. A -1 length
+// drops the terminating NUL from the result.
+std::string toUtf8(const wchar_t* s, int len);
+
+// ---- Filter arguments -------------------------------------------------------
+// Filter options shared by live / open / summary:
+//   --filter-file F (repeatable) and --filter-dir D: every config file becomes
+//     its own independent lens in one FilterGroup; lenses combine per --groups
+//     (any = OR, default; all = AND).
+//   -f/-x RULE: CLI rules form one extra FilterSet, applied alongside (AND) the
+//     lens group. --match procmon|any sets how that set combines includes.
+//   --pid / --proc / --failed: shortcuts compiled into the CLI rule set.
+struct FilterCli {
+  std::vector<const wchar_t*> files;
+  const wchar_t* dir = nullptr;
+  std::vector<std::wstring> includes, excludes;
+  const wchar_t* match = nullptr;
+  const wchar_t* groups = nullptr;
+  std::vector<std::wstring> pids;
+  std::vector<std::wstring> procs;
+  bool failed = false;
+};
+
+// Load one filter config, dispatching by extension: .reg / .pmc, else JSON.
+std::error_code loadFilterConfig(const wchar_t* path, pmx::FilterSet& out);
+
+// Load every config in a directory as its own lens (see FilterGroup).
+std::error_code loadFilterDir(const wchar_t* dir, pmx::FilterGroup& out);
+
+// Consume argv[i] (and its value) if it is a filter option; advances `i`.
+bool parseFilterArg(int argc, wchar_t** argv, int& i, FilterCli& fc);
+
+// Build the CLI rule set + lens group from parsed options. Returns 0, or a
+// process exit code after printing the error.
+int buildFilters(const FilterCli& fc, pmx::FilterSet& cliSet,
+                 pmx::FilterGroup& lenses);
+
+}  // namespace pmx::cli

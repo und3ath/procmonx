@@ -1,0 +1,24 @@
+{
+  "_desc": "Create/write/rename/delete/set-info in world-writable dirs by a privileged process: arbitrary-write / drop primitive. Restricted to High/System/Protected integrity callers (LPE-relevant). Noise (reads, queries, cache-map/flush, byte-range locks, *.log churn) excluded.",
+  "filters": [
+    { "column": "Class", "relation": "isNot", "value": "FileSystem", "action": "exclude" },
+    { "column": "Path", "relation": "contains", "value": "\\ProgramData\\", "action": "include" },
+    { "column": "Path", "relation": "contains", "value": "\\Users\\Public\\", "action": "include" },
+    { "column": "Path", "relation": "contains", "value": "\\Windows\\Temp\\", "action": "include" },
+    { "column": "Path", "relation": "contains", "value": "\\AppData\\Local\\Temp\\", "action": "include" },
+    { "column": "Operation", "relation": "beginsWith", "value": "Query", "action": "exclude" },
+    { "column": "Operation", "relation": "beginsWith", "value": "FASTIO", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "ReadFile", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "CloseFile", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "IRP_MJ_CLOSE", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "CreateFileMapping", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "LockFile", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "UnlockFileSingle", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "FlushBuffersFile", "action": "exclude" },
+    { "column": "Path", "relation": "endsWith", "value": ".log", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Medium", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Medium+", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Low", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Untrusted", "action": "exclude" }
+  ]
+}

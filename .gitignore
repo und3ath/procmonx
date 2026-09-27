@@ -1,0 +1,23 @@
+# Build output
+/build/
+
+# Procmon binaries + signed driver — NOT redistributed (drive a local install)
+/procmon/
+
+# Captures / exports / local configs
+*.pmxlog
+*.pml
+*.csv
+*.pmc
+*.reg
+cap_*.txt
+/hunt-out/
+
+# Editor / OS cruft
+.claude/
+.vs/
+*.user
+Thumbs.db
+
+# Private notes (memory, RE notes, old docs) - never published
+/.private/

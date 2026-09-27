@@ -1,0 +1,12 @@
+{
+  "_desc": "CreateFile in Temp by a privileged process: symlink/junction + oplock TOCTOU redirection surface. Restricted to High/System/Protected integrity callers (LPE-relevant).",
+  "filters": [
+    { "column": "Class", "relation": "isNot", "value": "FileSystem", "action": "exclude" },
+    { "column": "Operation", "relation": "is", "value": "CreateFile", "action": "include" },
+    { "column": "Path", "relation": "excludes", "value": "\Temp\\", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Medium", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Medium+", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Low", "action": "exclude" },
+    { "column": "Integrity", "relation": "is", "value": "Untrusted", "action": "exclude" }
+  ]
+}
