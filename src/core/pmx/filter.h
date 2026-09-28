@@ -87,9 +87,24 @@ std::optional<Rule> parseRule(const std::wstring& text, Action action);
 // Render a rule back to "<column> <relation> <value>" (for saving / display).
 std::wstring ruleToString(const Rule& r);
 
+namespace detail {
+// Precompiled form of a Rule: value lowercased and column-normalized once (at
+// add() time) plus a pre-parsed number, so matching never re-lowercases or
+// re-parses per event. See filter.cpp for the matcher that consumes this.
+struct CompiledRule {
+  Column column;
+  Relation relation;
+  Action action;
+  std::wstring normValue;         // lower(value), Result ' '->'_', EventClass spaces stripped
+  bool valueIsNumber = false;     // parseNumber(value) succeeded
+  uint64_t numberValue = 0;
+  bool resultNumericOrdering = false;  // Result Less/More vs a raw NTSTATUS number
+};
+}  // namespace detail
+
 class FilterSet {
  public:
-  void add(Rule r) { rules_.push_back(std::move(r)); }
+  void add(Rule r);
   bool empty() const noexcept { return rules_.empty(); }
   const std::vector<Rule>& rules() const noexcept { return rules_; }
   IncludeMode includeMode() const noexcept { return mode_; }
@@ -100,6 +115,7 @@ class FilterSet {
 
  private:
   std::vector<Rule> rules_;
+  std::vector<detail::CompiledRule> compiled_;
   IncludeMode mode_ = IncludeMode::PerColumn;
 };
 

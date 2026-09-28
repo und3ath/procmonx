@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -341,6 +342,60 @@ int test_filter() {
     CHECK(!fs.matches(mk(L"foo.dll", 1, "op", L"p", 0)));
   }
 
+  // EndsWith (and BeginsWith) where the rule value is longer than the field:
+  // never matches, never reads out of bounds.
+  {
+    FilterSet fs;
+    fs.add(*parseRule(L"ProcessName endswith way-too-long-a-suffix.exe",
+                       Action::Include));
+    CHECK(!fs.matches(mk(L"a.exe", 1, "op", L"p", 0)));
+    FilterSet fs2;
+    fs2.add(*parseRule(L"ProcessName beginswith way-too-long-a-prefix",
+                        Action::Include));
+    CHECK(!fs2.matches(mk(L"a.exe", 1, "op", L"p", 0)));
+  }
+
+  // LessThan/MoreThan on strings: case-insensitive lexicographic, same as
+  // comparing two lowered strings.
+  {
+    FilterSet lt;
+    lt.add(*parseRule(L"ProcessName lessthan M", Action::Include));
+    CHECK(lt.matches(mk(L"Alpha", 1, "op", L"p", 0)));   // 'a' < 'm'
+    CHECK(!lt.matches(mk(L"Zulu", 1, "op", L"p", 0)));    // 'z' > 'm'
+    FilterSet mt;
+    mt.add(*parseRule(L"ProcessName morethan alpha", Action::Include));
+    CHECK(mt.matches(mk(L"Beta", 1, "op", L"p", 0)));     // 'b' > 'a', case-folded
+    CHECK(!mt.matches(mk(L"Alpha", 1, "op", L"p", 0)));   // equal, not >
+  }
+
+  // EventClass: spaces are skipped on the event side too, not just the rule.
+  {
+    Event ev = mk(L"a", 1, "op", L"p", 0);
+    ev.className = "File System";  // space on the event side
+    FilterSet fs;
+    fs.add(*parseRule(L"Class is FileSystem", Action::Include));
+    CHECK(fs.matches(ev));
+    FilterSet fs2;
+    fs2.add(*parseRule(L"Class is File System", Action::Include));
+    CHECK(fs2.matches(ev));
+  }
+
+  // Numeric column (PID) with a string relation: still matches on the
+  // decimal text, without allocating.
+  {
+    FilterSet fs;
+    fs.add(*parseRule(L"PID contains 23", Action::Include));
+    CHECK(fs.matches(mk(L"a", 1234, "op", L"p", 0)));   // "1234" contains "23"
+    CHECK(!fs.matches(mk(L"a", 1567, "op", L"p", 0)));
+    FilterSet fs2;
+    fs2.add(*parseRule(L"Sequence beginswith 9", Action::Include));
+    Event ev = mk(L"a", 1, "op", L"p", 0);
+    ev.sequence = 900;
+    CHECK(fs2.matches(ev));
+    ev.sequence = 100;
+    CHECK(!fs2.matches(ev));
+  }
+
   // statusName mapping.
   CHECK(statusName(0) == "SUCCESS");
   CHECK(statusName(0xC0000034) == "NAME_NOT_FOUND");
@@ -398,6 +453,39 @@ int test_filter() {
     FilterSet cls;
     cls.add(*parseRule(L"Class is File System", Action::Include));
     CHECK(cls.matches(ev));
+  }
+
+  // Rough timing check (info only, no assertion): 10 lenses x 5 rules over
+  // 200k synthetic events.
+  {
+    FilterGroup group;
+    const wchar_t* names[] = {L"a.exe", L"b.exe", L"c.exe", L"svchost.exe",
+                               L"explorer.exe"};
+    const char* ops[] = {"ReadFile", "WriteFile", "CreateFile", "QueryOpen",
+                          "CloseFile"};
+    for (int lens = 0; lens < 10; ++lens) {
+      FilterSet fs;
+      fs.add(*parseRule(L"ProcessName contains exe", Action::Include));
+      fs.add(*parseRule(L"Operation isNot Nothing", Action::Include));
+      fs.add(*parseRule(L"Path beginsWith C:\\", Action::Include));
+      fs.add(*parseRule(L"PID morethan 0", Action::Include));
+      fs.add(*parseRule(L"ProcessName is z.exe", Action::Exclude));
+      group.addSet(fs);
+    }
+    const int kEvents = 200000;
+    size_t shown = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kEvents; ++i) {
+      Event ev = mk(names[i % 5], 100 + (i % 4000), ops[i % 5],
+                     (i % 3 == 0) ? L"C:\\Windows\\System32\\x" : L"D:\\data\\y",
+                     0);
+      ev.className = (i % 2 == 0) ? "FileSystem" : "Registry";
+      if (group.matches(ev)) ++shown;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::printf("INFO filter bench: 10 lenses x 5 rules x %d events = %.2f ms (shown=%zu)\n",
+                kEvents, ms, shown);
   }
 
   return g_failures - before;

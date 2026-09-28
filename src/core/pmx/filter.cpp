@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cwchar>
 #include <cwctype>
+#include <iterator>
 
 namespace pmx {
 
@@ -26,26 +28,6 @@ bool isNumericColumn(Column c) {
 
 std::wstring widenA(const std::string& s) { return {s.begin(), s.end()}; }
 
-// The event's value for a column, as a string (numeric columns use decimal).
-std::wstring fieldValue(const Event& ev, Column c) {
-  switch (c) {
-    case Column::ProcessName: return ev.processName;
-    case Column::Pid: return std::to_wstring(ev.pid);
-    case Column::ParentPid: return std::to_wstring(ev.parentPid);
-    case Column::Operation: return widenA(ev.opName);
-    case Column::Path: return ev.path;
-    case Column::Result: return widenA(statusName(ev.result));
-    case Column::Detail: return ev.detail;
-    case Column::EventClass: return widenA(ev.className);
-    case Column::ImagePath: return ev.imagePath;
-    case Column::CommandLine: return ev.commandLine;
-    case Column::Sequence: return std::to_wstring(ev.sequence);
-    case Column::User: return ev.user;
-    case Column::Integrity: return ev.integrity;
-  }
-  return {};
-}
-
 uint64_t numericField(const Event& ev, Column c) {
   switch (c) {
     case Column::Pid: return ev.pid;
@@ -67,55 +49,173 @@ bool parseNumber(const std::wstring& s, uint64_t& out) {
   }
 }
 
-bool ruleMatches(const Event& ev, const Rule& r) {
+// Per-character case-folding views over an event field, so the string
+// relations below can compare/search without lowercasing (i.e. allocating)
+// the field on every rule. `at(i)` returns the folded wchar_t at index i.
+struct WFolder {
+  const wchar_t* s;
+  size_t n;
+  wchar_t at(size_t i) const { return towlower(s[i]); }
+  size_t size() const { return n; }
+};
+struct AFolder {
+  const char* s;
+  size_t n;
+  wchar_t at(size_t i) const {
+    return static_cast<wchar_t>(towlower(static_cast<unsigned char>(s[i])));
+  }
+  size_t size() const { return n; }
+};
+
+template <class F>
+bool ciEqual(const F& hay, const std::wstring& needle) {
+  if (hay.size() != needle.size()) return false;
+  for (size_t i = 0; i < hay.size(); ++i)
+    if (hay.at(i) != needle[i]) return false;
+  return true;
+}
+
+template <class F>
+bool ciContains(const F& hay, const std::wstring& needle) {
+  if (needle.empty()) return true;
+  if (needle.size() > hay.size()) return false;
+  for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+    bool ok = true;
+    for (size_t j = 0; j < needle.size(); ++j)
+      if (hay.at(i + j) != needle[j]) { ok = false; break; }
+    if (ok) return true;
+  }
+  return false;
+}
+
+template <class F>
+bool ciBeginsWith(const F& hay, const std::wstring& needle) {
+  if (needle.size() > hay.size()) return false;
+  for (size_t j = 0; j < needle.size(); ++j)
+    if (hay.at(j) != needle[j]) return false;
+  return true;
+}
+
+template <class F>
+bool ciEndsWith(const F& hay, const std::wstring& needle) {
+  if (needle.size() > hay.size()) return false;
+  const size_t off = hay.size() - needle.size();
+  for (size_t j = 0; j < needle.size(); ++j)
+    if (hay.at(off + j) != needle[j]) return false;
+  return true;
+}
+
+// <0 / 0 / >0, lexicographic over folded chars (same ordering as comparing
+// two already-lowered std::wstrings).
+template <class F>
+int ciCompare(const F& hay, const std::wstring& needle) {
+  const size_t n = (hay.size() < needle.size()) ? hay.size() : needle.size();
+  for (size_t i = 0; i < n; ++i) {
+    const wchar_t a = hay.at(i), b = needle[i];
+    if (a != b) return a < b ? -1 : 1;
+  }
+  if (hay.size() < needle.size()) return -1;
+  if (hay.size() > needle.size()) return 1;
+  return 0;
+}
+
+template <class F>
+bool matchByRelation(const F& hay, Relation rel, const std::wstring& rhs) {
+  switch (rel) {
+    case Relation::Is: return ciEqual(hay, rhs);
+    case Relation::IsNot: return !ciEqual(hay, rhs);
+    case Relation::Contains: return ciContains(hay, rhs);
+    case Relation::Excludes: return !ciContains(hay, rhs);
+    case Relation::BeginsWith: return ciBeginsWith(hay, rhs);
+    case Relation::EndsWith: return ciEndsWith(hay, rhs);
+    case Relation::LessThan: return ciCompare(hay, rhs) < 0;
+    case Relation::MoreThan: return ciCompare(hay, rhs) > 0;
+    default: return false;
+  }
+}
+
+bool matchWide(const std::wstring& s, Relation rel, const std::wstring& rhs) {
+  return matchByRelation(WFolder{s.data(), s.size()}, rel, rhs);
+}
+bool matchAscii(const std::string& s, Relation rel, const std::wstring& rhs) {
+  return matchByRelation(AFolder{s.data(), s.size()}, rel, rhs);
+}
+// EventClass: skip spaces on the event side too (rule side already stripped
+// them into normValue at compile time). className is a short friendly name
+// ("FileSystem", "Registry", ...), so a small stack buffer is enough.
+bool matchEventClass(const std::string& s, Relation rel, const std::wstring& rhs) {
+  char buf[64];
+  size_t n = 0;
+  for (char ch : s) {
+    if (ch == ' ') continue;
+    if (n < sizeof buf) buf[n++] = ch;
+  }
+  return matchByRelation(AFolder{buf, n}, rel, rhs);
+}
+// Numeric column vs a string relation (Contains etc.): format into a stack
+// buffer instead of std::to_wstring, same decimal text either way.
+bool matchNumericAsString(uint64_t v, Relation rel, const std::wstring& rhs) {
+  wchar_t buf[24];
+  int n = swprintf(buf, std::size(buf), L"%llu", (unsigned long long)v);
+  return matchByRelation(WFolder{buf, n > 0 ? (size_t)n : 0}, rel, rhs);
+}
+
+// Per-matches() context: statusName(ev.result) is formatted at most once,
+// lazily, even though several Result rules may consult it.
+struct MatchContext {
+  const Event& ev;
+  mutable std::string resultName;
+  mutable bool resultNameComputed = false;
+  const std::string& resultNameStr() const {
+    if (!resultNameComputed) {
+      resultName = statusName(ev.result);
+      resultNameComputed = true;
+    }
+    return resultName;
+  }
+};
+
+bool ruleMatches(const MatchContext& ctx, const detail::CompiledRule& c) {
+  const Event& ev = ctx.ev;
   // Result orders by its raw NTSTATUS when compared against a number, e.g.
   // "Result moreThan 0xBFFFFFFF" = error severity (what --failed uses). Name
   // relations ("Result is NAME_NOT_FOUND") stay string compares below.
-  uint64_t num = 0;
-  if (r.column == Column::Result &&
-      (r.relation == Relation::LessThan || r.relation == Relation::MoreThan) &&
-      parseNumber(r.value, num))
-    return r.relation == Relation::LessThan ? ev.result < num : ev.result > num;
+  if (c.resultNumericOrdering)
+    return c.relation == Relation::LessThan ? ev.result < c.numberValue
+                                             : ev.result > c.numberValue;
 
   // Numeric columns compare as integers for ordering / equality.
-  if (isNumericColumn(r.column) &&
-      (r.relation == Relation::Is || r.relation == Relation::IsNot ||
-       r.relation == Relation::LessThan || r.relation == Relation::MoreThan)) {
-    uint64_t lhs = numericField(ev, r.column);
-    uint64_t rhs = 0;
-    if (!parseNumber(r.value, rhs))
-      return r.relation == Relation::IsNot;  // a number never "is" a non-number
-    switch (r.relation) {
-      case Relation::Is: return lhs == rhs;
-      case Relation::IsNot: return lhs != rhs;
-      case Relation::LessThan: return lhs < rhs;
-      case Relation::MoreThan: return lhs > rhs;
+  if (isNumericColumn(c.column) &&
+      (c.relation == Relation::Is || c.relation == Relation::IsNot ||
+       c.relation == Relation::LessThan || c.relation == Relation::MoreThan)) {
+    uint64_t lhs = numericField(ev, c.column);
+    if (!c.valueIsNumber)
+      return c.relation == Relation::IsNot;  // a number never "is" a non-number
+    switch (c.relation) {
+      case Relation::Is: return lhs == c.numberValue;
+      case Relation::IsNot: return lhs != c.numberValue;
+      case Relation::LessThan: return lhs < c.numberValue;
+      case Relation::MoreThan: return lhs > c.numberValue;
       default: return false;
     }
   }
 
-  std::wstring lhs = lower(fieldValue(ev, r.column));
-  std::wstring rhs = lower(r.value);
-  // Accept Procmon's spellings ("NAME NOT FOUND", "File System") for ours.
-  if (r.column == Column::Result) {
-    std::replace(rhs.begin(), rhs.end(), L' ', L'_');
-  } else if (r.column == Column::EventClass) {
-    std::erase(lhs, L' ');
-    std::erase(rhs, L' ');
+  switch (c.column) {
+    case Column::ProcessName: return matchWide(ev.processName, c.relation, c.normValue);
+    case Column::Path: return matchWide(ev.path, c.relation, c.normValue);
+    case Column::Detail: return matchWide(ev.detail, c.relation, c.normValue);
+    case Column::ImagePath: return matchWide(ev.imagePath, c.relation, c.normValue);
+    case Column::CommandLine: return matchWide(ev.commandLine, c.relation, c.normValue);
+    case Column::User: return matchWide(ev.user, c.relation, c.normValue);
+    case Column::Integrity: return matchWide(ev.integrity, c.relation, c.normValue);
+    case Column::Operation: return matchAscii(ev.opName, c.relation, c.normValue);
+    case Column::EventClass: return matchEventClass(ev.className, c.relation, c.normValue);
+    case Column::Result: return matchAscii(ctx.resultNameStr(), c.relation, c.normValue);
+    case Column::Pid: return matchNumericAsString(ev.pid, c.relation, c.normValue);
+    case Column::ParentPid: return matchNumericAsString(ev.parentPid, c.relation, c.normValue);
+    case Column::Sequence: return matchNumericAsString(ev.sequence, c.relation, c.normValue);
   }
-  switch (r.relation) {
-    case Relation::Is: return lhs == rhs;
-    case Relation::IsNot: return lhs != rhs;
-    case Relation::Contains: return lhs.find(rhs) != std::wstring::npos;
-    case Relation::Excludes: return lhs.find(rhs) == std::wstring::npos;
-    case Relation::BeginsWith: return lhs.rfind(rhs, 0) == 0;
-    case Relation::EndsWith:
-      return rhs.size() <= lhs.size() &&
-             lhs.compare(lhs.size() - rhs.size(), rhs.size(), rhs) == 0;
-    case Relation::LessThan: return lhs < rhs;
-    case Relation::MoreThan: return lhs > rhs;
-    default: return false;
-  }
+  return false;
 }
 }  // namespace
 
@@ -213,6 +313,27 @@ std::wstring ruleToString(const Rule& r) {
   return out;
 }
 
+void FilterSet::add(Rule r) {
+  detail::CompiledRule c;
+  c.column = r.column;
+  c.relation = r.relation;
+  c.action = r.action;
+  std::wstring norm = lower(r.value);
+  if (r.column == Column::Result) {
+    std::replace(norm.begin(), norm.end(), L' ', L'_');
+  } else if (r.column == Column::EventClass) {
+    std::erase(norm, L' ');
+  }
+  c.normValue = std::move(norm);
+  c.valueIsNumber = parseNumber(r.value, c.numberValue);
+  c.resultNumericOrdering =
+      r.column == Column::Result &&
+      (r.relation == Relation::LessThan || r.relation == Relation::MoreThan) &&
+      c.valueIsNumber;
+  compiled_.push_back(std::move(c));
+  rules_.push_back(std::move(r));
+}
+
 bool FilterSet::matches(const Event& ev) const {
   // Any matching Exclude hides the event. PerColumn (Procmon): includes on the
   // SAME column are OR'd, groups on DIFFERENT columns AND'd (e.g. "ProcessName
@@ -221,15 +342,16 @@ bool FilterSet::matches(const Event& ev) const {
   constexpr size_t kCols = static_cast<size_t>(Column::Integrity) + 1;
   bool hasInclude[kCols] = {};
   bool matchedInclude[kCols] = {};
-  for (const auto& r : rules_) {
-    const bool m = ruleMatches(ev, r);
-    if (r.action == Action::Exclude) {
+  MatchContext ctx{ev};
+  for (const auto& c : compiled_) {
+    const bool m = ruleMatches(ctx, c);
+    if (c.action == Action::Exclude) {
       if (m) return false;
     } else {
-      const size_t c =
-          mode_ == IncludeMode::Any ? 0 : static_cast<size_t>(r.column);
-      hasInclude[c] = true;
-      if (m) matchedInclude[c] = true;
+      const size_t idx =
+          mode_ == IncludeMode::Any ? 0 : static_cast<size_t>(c.column);
+      hasInclude[idx] = true;
+      if (m) matchedInclude[idx] = true;
     }
   }
   for (size_t c = 0; c < kCols; ++c)
