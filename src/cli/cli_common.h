@@ -25,8 +25,13 @@ extern bool g_jsonStdout;      // --json -: stdout is JSON Lines
 extern bool g_noPause;         // --no-pause: elevated window closes on exit
 // A second Ctrl-C while a live/net capture is draining its spool to the output
 // files: stop early instead of waiting for the rest to write out. The files
-// stay valid (just short); set by main.cpp's ctrlHandler.
+// stay valid (just short); only meaningful while g_writing is true, so
+// finalizeSpool clears it right before setting g_writing. Set by main.cpp's
+// ctrlHandler.
 extern std::atomic<bool> g_abortWrite;
+// True only while finalizeSpool is draining the spool into the output files;
+// gates whether a Ctrl-C should set g_abortWrite. Set/cleared by finalizeSpool.
+extern std::atomic<bool> g_writing;
 
 void writeOut(const char* s, size_t n);
 void outf(const char* fmt, ...);        // console/file stream

@@ -190,10 +190,13 @@ void ensureElevated(int argc, wchar_t** argv) {
 BOOL WINAPI ctrlHandler(DWORD type) {
   if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
     // First Ctrl-C: stop capturing, let the spool drain to the output files.
-    // A second one (g_stop already set - the drain is what's taking a while)
-    // aborts that drain early; finalizeSpool still closes the files, just short.
-    if (g_stop) {
+    // A later one only aborts the write if finalizeSpool is actually draining
+    // right now; before that (teardown still running) it just acknowledges -
+    // aborting there would cut a capture down to almost nothing.
+    if (g_writing) {
       g_abortWrite = true;
+    } else if (g_stop) {
+      errf("(still stopping - please wait)\n");
     } else {
       g_stop = true;
       if (g_client) g_client->cancel();

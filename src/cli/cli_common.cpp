@@ -22,6 +22,7 @@ bool g_silent = false;
 bool g_jsonStdout = false;
 bool g_noPause = false;
 std::atomic<bool> g_abortWrite{false};
+std::atomic<bool> g_writing{false};
 
 void writeOut(const char* s, size_t n) {
   if (!g_silent) std::fwrite(s, 1, n, stdout);
@@ -377,6 +378,8 @@ int finalizeSpool(pmx::EventSpool& spool, const LiveOutputPaths& paths,
   const uint64_t total = spool.count();
   statusf("Writing %llu events... (Ctrl-C to stop early; files stay valid)\n",
          (unsigned long long)total);
+  g_abortWrite = false;
+  g_writing = true;
 
   uint64_t written = 0;
   ULONGLONG lastTick = GetTickCount64();
@@ -400,6 +403,7 @@ int finalizeSpool(pmx::EventSpool& spool, const LiveOutputPaths& paths,
     }
     return !writeErr && !g_abortWrite;
   });
+  g_writing = false;
   if (showProgress) errf("\n");
 
   if (writeErr) {
