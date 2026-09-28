@@ -115,6 +115,19 @@ int test_writers() {
     _wremove(L"pmx_test_w2.csv");
   }
 
+  // Formula-looking fields are neutralised with a leading quote.
+  {
+    std::vector<Event> ev(1);
+    ev[0].processName = L"=cmd|' /C calc'!A0";
+    ev[0].path = L"C:\\ok\\-not-first.txt";
+    CHECK(!saveEventsCsv(L"pmx_test_w3.csv", ev));
+    std::string s;
+    CHECK(!readWholeFile(L"pmx_test_w3.csv", s));
+    CHECK(s.find("\"'=cmd|' /C calc'!A0\"") != std::string::npos);
+    CHECK(s.find("\"C:\\ok\\-not-first.txt\"") != std::string::npos);
+    _wremove(L"pmx_test_w3.csv");
+  }
+
   // JsonWriter byte-identical to saveEventsJson.
   {
     JsonWriter w;

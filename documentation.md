@@ -174,7 +174,8 @@ is also accepted.
 - **`.pml`** — Process Monitor's log format (v9, x64). `--pml` writes one that
   opens in Process Monitor; `pmx open FILE.pml` reads one.
 - **CSV** (`--csv`) — Time, Process Name, PID, User, Integrity, Operation, Path,
-  Result, Detail, Duration; RFC-4180 quoted.
+  Result, Detail, Duration; RFC-4180 quoted. A field starting with `=`, `+`, `-`,
+  `@`, tab or CR gets a leading `'` so spreadsheets don't run it as a formula.
 - **JSON Lines** (`--json`) — one object per event; `--json -` streams to stdout
   (status lines go to stderr, so the stream stays parseable). Fields: `time`
   (ISO-8601 UTC), `ts`, `class`, `op`, `process`, `pid`, `tid`, `ppid`, `user`,

@@ -241,6 +241,9 @@ std::error_code saveEvents(const wchar_t* path, std::span<const Event> events) {
 namespace {
 void csvField(std::string& out, const std::string& s) {
   out.push_back('"');
+  // Captured names are attacker-chosen: a leading = + - @ (or tab/CR) would
+  // run as a formula when the CSV is opened in a spreadsheet.
+  if (!s.empty() && s[0] && std::strchr("=+-@\t\r", s[0])) out.push_back('\'');
   for (char c : s) {
     if (c == '"') out.push_back('"');  // double the quote
     out.push_back(c);
