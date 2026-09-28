@@ -334,7 +334,7 @@ void dumpDetail(std::span<const uint8_t> d, size_t n, bool isProcess) {
   }
   std::wstring_view p = extractPath(d);
   if (!p.empty()) {
-    std::string pu = toUtf8(p.data(), (int)p.size());
+    std::string pu = printable(toUtf8(p.data(), (int)p.size()));
     outf("      path: %s\n", pu.c_str());
   }
 }
@@ -356,8 +356,11 @@ void printRow(long long n, const pmx::Event& ev) {
     who += "[" +
            toUtf8(ev.integrity.data(), static_cast<int>(ev.integrity.size())) +
            "]";
-  std::string pathU = toUtf8(ev.path.data(), static_cast<int>(ev.path.size()));
-  std::string detU = toUtf8(ev.detail.data(), static_cast<int>(ev.detail.size()));
+  who = printable(std::move(who));
+  std::string pathU =
+      printable(toUtf8(ev.path.data(), static_cast<int>(ev.path.size())));
+  std::string detU =
+      printable(toUtf8(ev.detail.data(), static_cast<int>(ev.detail.size())));
   std::string res = pmx::statusName(ev.result);
   char dur[24] = "";
   if (ev.duration)
@@ -560,7 +563,8 @@ struct SummaryAgg {
     long long shown = 0;
     for (const auto& [key, a] : rows) {
       if (top > 0 && shown++ >= top) break;
-      const std::string k = toUtf8(key.data(), static_cast<int>(key.size()));
+      const std::string k =
+          printable(toUtf8(key.data(), static_cast<int>(key.size())));
       outf("%10llu %5.1f%% %8llu  %s\n", (unsigned long long)a.count,
            100.0 * a.count / totalD, (unsigned long long)a.failed, k.c_str());
     }

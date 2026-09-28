@@ -1,4 +1,5 @@
 #include "pmx/driver/flags.h"
+#include "pmx/printable.h"
 
 #include <string>
 
@@ -7,6 +8,13 @@
 int test_flags() {
   int before = g_failures;
   using pmx::proto::accessMaskString;
+
+  // Control characters from captured text are escaped before printing.
+  CHECK(pmx::printable("C:\\a\\b.txt") == "C:\\a\\b.txt");
+  CHECK(pmx::printable("x\x1b[2Jy") == "x\\x1B[2Jy");
+  CHECK(pmx::printable("a\x7f\tb") == "a\\x7F\\x09b");
+  CHECK(pmx::printable("\xC2\x9B" "31m") == "\\x9B31m");            // C1 CSI
+  CHECK(pmx::printable("caf\xC3\xA9 \xC2\xA0") == "caf\xC3\xA9 \xC2\xA0");  // not C1
 
   // Combined generics collapse to a single friendly name.
   CHECK(accessMaskString(0x00120089) == "Generic Read");

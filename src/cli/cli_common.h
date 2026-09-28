@@ -11,6 +11,7 @@
 
 #include "pmx/event.h"
 #include "pmx/filter.h"
+#include "pmx/printable.h"
 #include "pmx/spool.h"
 
 namespace pmx::cli {
@@ -49,6 +50,8 @@ void printError(const char* what, std::error_code ec, const std::string& why);
 // Convert `len` wchars (or -1 for a NUL-terminated string) to UTF-8. A -1 length
 // drops the terminating NUL from the result.
 std::string toUtf8(const wchar_t* s, int len);
+
+using pmx::printable;
 
 // ---- Filter arguments -------------------------------------------------------
 // Filter options shared by live / open / summary:
