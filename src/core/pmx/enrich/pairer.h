@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "pmx/driver/port_client.h"
@@ -62,8 +63,17 @@ class Pairer {
   size_t pendingCount() const noexcept { return bySeq_.size(); }
 
  private:
-  // Ordered by the driver's monotonic sequence, so begin() = oldest pending.
-  std::map<uint32_t, CompletedEvent> bySeq_;  // key = request sequence
+  struct Pending {
+    CompletedEvent ev;
+    uint64_t arrival;
+  };
+  void evict(uint32_t seq);
+
+  std::unordered_map<uint32_t, Pending> bySeq_;  // key = request sequence
+  // Age order by arrival, not by sequence: the u32 sequence wraps on long
+  // captures, after which the smallest sequence is the newest request.
+  std::map<uint64_t, uint32_t> byArrival_;
+  uint64_t nextArrival_ = 0;
   std::vector<CompletedEvent> evicted_;
   size_t maxPending_;
 };

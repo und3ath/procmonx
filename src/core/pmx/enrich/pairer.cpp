@@ -4,6 +4,14 @@
 
 namespace pmx {
 
+void Pairer::evict(uint32_t seq) {
+  auto it = bySeq_.find(seq);
+  if (it == bySeq_.end()) return;
+  byArrival_.erase(it->second.arrival);
+  evicted_.push_back(std::move(it->second.ev));
+  bySeq_.erase(it);
+}
+
 std::optional<CompletedEvent> Pairer::consume(const RawRecord& r) {
   const auto& h = *r.header;
 
@@ -11,7 +19,8 @@ std::optional<CompletedEvent> Pairer::consume(const RawRecord& r) {
   if (h.eventClass == static_cast<uint16_t>(proto::EventClass::System)) {
     auto it = bySeq_.find(h.sequence);
     if (it == bySeq_.end()) return std::nullopt;  // no matching request
-    CompletedEvent ev = std::move(it->second);
+    CompletedEvent ev = std::move(it->second.ev);
+    byArrival_.erase(it->second.arrival);
     bySeq_.erase(it);
     ev.finalResult = h.result;
     ev.information = 0;
@@ -36,22 +45,22 @@ std::optional<CompletedEvent> Pairer::consume(const RawRecord& r) {
   // Synchronous completion (already has a final status) — emit immediately.
   if (h.result != proto::kStatusPending) return ev;
 
-  // Pending: buffer until the completion arrives. If a stale entry shares this
-  // sequence (wraparound / dropped completion), it is overwritten.
-  bySeq_[h.sequence] = std::move(ev);
-  while (bySeq_.size() > maxPending_) {
-    auto oldest = bySeq_.begin();
-    evicted_.push_back(std::move(oldest->second));
-    bySeq_.erase(oldest);
-  }
+  // Pending: buffer until the completion arrives. A stale entry with the same
+  // sequence (wraparound / dropped completion) is emitted unmatched, not lost.
+  evict(h.sequence);
+  const uint64_t arrival = nextArrival_++;
+  bySeq_.emplace(h.sequence, Pending{std::move(ev), arrival});
+  byArrival_.emplace(arrival, h.sequence);
+  while (bySeq_.size() > maxPending_) evict(byArrival_.begin()->second);
   return std::nullopt;
 }
 
 std::vector<CompletedEvent> Pairer::flush() {
   std::vector<CompletedEvent> out;
   out.reserve(bySeq_.size());
-  for (auto& [seq, ev] : bySeq_) out.push_back(std::move(ev));
+  for (auto& [arrival, seq] : byArrival_) out.push_back(std::move(bySeq_[seq].ev));
   bySeq_.clear();
+  byArrival_.clear();
   return out;
 }
 

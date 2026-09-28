@@ -108,5 +108,29 @@ int test_pairer() {
     CHECK(!p.consume(makeRec(hc, 0, 0, 10, 0, d)));  // evicted: no match
     CHECK(p.consume(makeRec(hc, 0, 0, 12, 0, d)).has_value());
   }
+
+  // Sequence wraparound: eviction follows arrival, so after the u32 sequence
+  // wraps the pre-wrap (older) request is evicted, not the newer small one.
+  {
+    Pairer p(2);
+    proto::EventRecordHeader h{};
+    std::vector<uint8_t> d(8, 0);
+    CHECK(!p.consume(makeRec(h, 3, 20, 0xFFFFFFFEu, proto::kStatusPending, d)));
+    CHECK(!p.consume(makeRec(h, 3, 20, 0xFFFFFFFFu, proto::kStatusPending, d)));
+    CHECK(!p.consume(makeRec(h, 3, 20, 1, proto::kStatusPending, d)));
+    auto ev = p.takeEvicted();
+    CHECK(ev.size() == 1);
+    if (ev.size() == 1) CHECK(ev[0].header.sequence == 0xFFFFFFFEu);
+    // A reused sequence emits the stale request instead of dropping it.
+    CHECK(!p.consume(makeRec(h, 3, 20, 1, proto::kStatusPending, d)));
+    ev = p.takeEvicted();
+    CHECK(ev.size() == 1);
+    auto rest = p.flush();
+    CHECK(rest.size() == 2);
+    if (rest.size() == 2) {  // flush in arrival order
+      CHECK(rest[0].header.sequence == 0xFFFFFFFFu);
+      CHECK(rest[1].header.sequence == 1);
+    }
+  }
   return g_failures - before;
 }
