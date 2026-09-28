@@ -16,21 +16,27 @@
 //   }
 //
 // parseFilterBlob decodes that blob; loadFilterReg pulls the "FilterRules" value
-// out of a `reg export` .reg text file and parses it. Columns Procmon has that we
-// don't model are skipped.
+// out of a `reg export` .reg text file and parses it. Rules on columns we don't
+// model are skipped and reported.
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <system_error>
+#include <vector>
 
 #include "pmx/filter.h"
 
 namespace pmx {
 
-// Parse a raw FilterRules blob. Returns false if the header is malformed.
-bool parseFilterBlob(const uint8_t* data, size_t n, FilterSet& out);
+// Parse a raw FilterRules blob. Returns false if the header is malformed. Each
+// rule that can't be imported (unknown column/relation code) is described in
+// `skipped`, if given.
+bool parseFilterBlob(const uint8_t* data, size_t n, FilterSet& out,
+                     std::vector<std::string>* skipped = nullptr);
 
 // Load filter rules from a `reg export` .reg file (finds the FilterRules value).
-std::error_code loadFilterReg(const wchar_t* path, FilterSet& out);
+std::error_code loadFilterReg(const wchar_t* path, FilterSet& out,
+                              std::vector<std::string>* skipped = nullptr);
 
 }  // namespace pmx

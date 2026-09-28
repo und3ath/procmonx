@@ -94,8 +94,15 @@ bool ruleMatches(const Event& ev, const Rule& r) {
     }
   }
 
-  const std::wstring lhs = lower(fieldValue(ev, r.column));
-  const std::wstring rhs = lower(r.value);
+  std::wstring lhs = lower(fieldValue(ev, r.column));
+  std::wstring rhs = lower(r.value);
+  // Accept Procmon's spellings ("NAME NOT FOUND", "File System") for ours.
+  if (r.column == Column::Result) {
+    std::replace(rhs.begin(), rhs.end(), L' ', L'_');
+  } else if (r.column == Column::EventClass) {
+    std::erase(lhs, L' ');
+    std::erase(rhs, L' ');
+  }
   switch (r.relation) {
     case Relation::Is: return lhs == rhs;
     case Relation::IsNot: return lhs != rhs;

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cstdio>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -40,7 +41,8 @@ std::optional<Relation> mapRelation(uint32_t r) {
 }
 }  // namespace
 
-bool parseFilterBlob(const uint8_t* d, size_t n, FilterSet& out) {
+bool parseFilterBlob(const uint8_t* d, size_t n, FilterSet& out,
+                     std::vector<std::string>* skipped) {
   if (n < 5) return false;
   size_t p = 0;
   /* version */ ++p;
@@ -49,14 +51,21 @@ bool parseFilterBlob(const uint8_t* d, size_t n, FilterSet& out) {
   p += 4;
 
   for (uint32_t i = 0; i < count; ++i) {
-    if (p + 13 > n) break;  // col+rel+action+len
-    uint32_t col, rel, vlen;
-    std::memcpy(&col, d + p, 4);
-    std::memcpy(&rel, d + p + 4, 4);
-    uint8_t action = d[p + 8];
-    std::memcpy(&vlen, d + p + 9, 4);
+    uint32_t col = 0, rel = 0, vlen = 0;
+    uint8_t action = 0;
+    if (p + 13 <= n) {
+      std::memcpy(&col, d + p, 4);
+      std::memcpy(&rel, d + p + 4, 4);
+      action = d[p + 8];
+      std::memcpy(&vlen, d + p + 9, 4);
+    }
+    if (p + 13 > n || p + 13 + vlen > n) {
+      if (skipped)
+        skipped->push_back("truncated: rules " + std::to_string(i + 1) + ".." +
+                           std::to_string(count) + " missing");
+      break;
+    }
     p += 13;
-    if (p + vlen > n) break;
 
     std::wstring value(reinterpret_cast<const wchar_t*>(d + p), vlen / 2);
     while (!value.empty() && value.back() == L'\0') value.pop_back();
@@ -65,14 +74,21 @@ bool parseFilterBlob(const uint8_t* d, size_t n, FilterSet& out) {
 
     auto column = mapColumn(col);
     auto relation = mapRelation(rel);
-    if (column && relation)
+    if (column && relation) {
       out.add(Rule{*column, *relation, value,
                    action ? Action::Include : Action::Exclude});
+    } else if (skipped) {
+      char b[96];
+      std::snprintf(b, sizeof b, "rule %u: %s column 0x%X relation %u",
+                    i + 1, action ? "include" : "exclude", col, rel);
+      skipped->push_back(b);
+    }
   }
   return true;
 }
 
-std::error_code loadFilterReg(const wchar_t* path, FilterSet& out) {
+std::error_code loadFilterReg(const wchar_t* path, FilterSet& out,
+                              std::vector<std::string>* skipped) {
   HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE) return errc((int)GetLastError());
@@ -112,7 +128,8 @@ std::error_code loadFilterReg(const wchar_t* path, FilterSet& out) {
     }
   }
   if (blob.empty()) return errc(ERROR_INVALID_DATA);
-  parseFilterBlob(blob.data(), blob.size(), out);
+  if (!parseFilterBlob(blob.data(), blob.size(), out, skipped))
+    return errc(ERROR_INVALID_DATA);
   return {};
 }
 

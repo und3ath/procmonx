@@ -100,8 +100,14 @@ std::string toUtf8(const wchar_t* s, int len) {
 std::error_code loadFilterConfig(const wchar_t* path, pmx::FilterSet& out,
                                  std::string* why) {
   const wchar_t* dot = wcsrchr(path, L'.');
-  if (dot && (!_wcsicmp(dot, L".reg") || !_wcsicmp(dot, L".pmc")))
-    return pmx::loadFilterReg(path, out);
+  if (dot && (!_wcsicmp(dot, L".reg") || !_wcsicmp(dot, L".pmc"))) {
+    std::vector<std::string> skipped;
+    std::error_code ec = pmx::loadFilterReg(path, out, &skipped);
+    // A dropped include can make the lens match more than Procmon's would.
+    for (const auto& s : skipped)
+      errf("filter %ls: not imported - %s\n", path, s.c_str());
+    return ec;
+  }
   return pmx::loadFilterJson(path, out, why);
 }
 

@@ -370,5 +370,35 @@ int test_filter() {
     }
   }
 
+  // Unmapped column codes and truncation are reported, not silently dropped.
+  {
+    std::vector<uint8_t> b;
+    b.push_back(1);
+    putU32le(b, 3);
+    putRule(b, 0x9c75, 0, 1, L"a.exe");
+    putRule(b, 0x9cff, 0, 1, L"x");  // unknown column
+    FilterSet fs;
+    std::vector<std::string> skipped;
+    CHECK(parseFilterBlob(b.data(), b.size(), fs, &skipped));
+    CHECK(fs.rules().size() == 1);
+    CHECK(skipped.size() == 2);  // rule 2 unmapped, rule 3 missing
+    if (skipped.size() == 2) {
+      CHECK(skipped[0].find("rule 2") != std::string::npos);
+      CHECK(skipped[1].find("truncated") != std::string::npos);
+    }
+  }
+
+  // Procmon's spellings match our names.
+  {
+    FilterSet fs;
+    fs.add(*parseRule(L"Result is NAME NOT FOUND", Action::Include));
+    CHECK(fs.matches(mk(L"a", 1, "CreateFile", L"p", 0xC0000034)));
+    Event ev = mk(L"a", 1, "CreateFile", L"p", 0);
+    ev.className = "FileSystem";
+    FilterSet cls;
+    cls.add(*parseRule(L"Class is File System", Action::Include));
+    CHECK(cls.matches(ev));
+  }
+
   return g_failures - before;
 }
