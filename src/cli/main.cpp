@@ -584,7 +584,7 @@ int cmdOpenOrSummary(int argc, wchar_t** argv, bool summary) {
            "         [--top N] [filters as for open]\n");
     else
       outf("open: pmx open FILE.(pmxlog|pml) [-f RULE] [-x RULE] "
-           "[--filter-file cfg]... [--filter-dir DIR] [--match procmon|any] "
+           "[--filter-file cfg]... [--filter-dir DIR]... [--match procmon|any] "
            "[--groups any|all] [--pid N] [--proc NAME] [--failed] [--class C] "
            "[--count N] [--csv F] [--pml F] [--json F|-] [--quiet] "
            "[--config F] [--buffer-mb N] [--spool-dir DIR]\n");
@@ -1226,7 +1226,7 @@ void usage() {
       "  pmx driver status\n"
       "  pmx driver load|unload|install|remove [--name NAME] [--sys PATH]\n"
       "  pmx live [--flags 0xMASK] [--rate HZ] [--count N] [--class C] [--hex N]\n"
-      "           [-f RULE] [-x RULE] [--filter-file cfg]... [--filter-dir DIR]\n"
+      "           [-f RULE] [-x RULE] [--filter-file cfg]... [--filter-dir DIR]...\n"
       "           [--match procmon|any] [--groups any|all]\n"
       "           [--pid N] [--proc NAME] [--failed]\n"
       "           [--save FILE] [--csv FILE] [--pml OUT.pml] [--json FILE|-] [--raw] [--net]\n"
@@ -1248,7 +1248,7 @@ void usage() {
       "           Ctrl-C stops the capture and starts writing files; a second Ctrl-C\n"
       "           while that write is in progress aborts it early (files stay valid,\n"
       "           just short).\n"
-      "  pmx open FILE.(pmxlog|pml) [-f RULE] [-x RULE] [--filter-file cfg]... [--filter-dir DIR]\n"
+      "  pmx open FILE.(pmxlog|pml) [-f RULE] [-x RULE] [--filter-file cfg]... [--filter-dir DIR]...\n"
       "           [--match procmon|any] [--groups any|all] [--pid N] [--proc NAME] [--failed]\n"
       "           [--class C] [--count N] [--csv OUT.csv] [--pml OUT.pml] [--json FILE|-]\n"
       "           [--summary [--by K] [--top N]] [--quiet]\n"
@@ -1267,7 +1267,7 @@ void usage() {
       "    = error). Keys: \"buffer_mb\" (int, clamped >= 16), \"spool_dir\" (string).\n"
       "    --buffer-mb/--spool-dir on the command line override the config file.\n"
       "  filtering (live/open):\n"
-      "    --filter-file F (repeatable) / --filter-dir D: each file = an independent\n"
+      "    --filter-file F / --filter-dir D (both repeatable): each file = an independent\n"
       "      lens with its own includes/excludes; lenses OR'd (--groups any, default)\n"
       "      or AND'd (--groups all)\n"
       "    -f/-x RULE: CLI rule set, AND'd with the lenses\n"

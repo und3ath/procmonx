@@ -42,7 +42,7 @@ pmx summary FILE.(pmxlog|pml) [--by path|proc|pid|op|result|class] [--top N] [fi
 pmx filters FILE|DIR...
 pmx elevate <args…>
 
-filters:    -f RULE  -x RULE  --filter-file F (repeatable)  --filter-dir DIR
+filters:    -f RULE  -x RULE  --filter-file F  --filter-dir DIR  (both repeatable)
             --match procmon|any  --groups any|all  --pid N  --proc NAME  --failed
 ```
 

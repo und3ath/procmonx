@@ -164,7 +164,7 @@ bool parseFilterArg(int argc, wchar_t** argv, int& i, FilterCli& fc) {
   else if (!wcscmp(a, L"--filter-file") && hasVal)
     fc.files.push_back(argv[++i]);
   else if (!wcscmp(a, L"--filter-dir") && hasVal)
-    fc.dir = argv[++i];
+    fc.dirs.push_back(argv[++i]);
   else if (!wcscmp(a, L"--match") && hasVal)
     fc.match = argv[++i];
   else if (!wcscmp(a, L"--groups") && hasVal)
@@ -198,9 +198,9 @@ int buildFilters(const FilterCli& fc, pmx::FilterSet& cliSet,
     }
     lenses.setMode(*g);
   }
-  if (fc.dir) {
+  for (const wchar_t* dir : fc.dirs) {
     std::string why;
-    std::error_code fe = loadFilterDir(fc.dir, lenses, &why);
+    std::error_code fe = loadFilterDir(dir, lenses, &why);
     if (fe) {
       printError("filter-dir", fe, why);
       return 2;

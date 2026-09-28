@@ -55,7 +55,7 @@ using pmx::printable;
 
 // ---- Filter arguments -------------------------------------------------------
 // Filter options shared by live / open / summary:
-//   --filter-file F (repeatable) and --filter-dir D: every config file becomes
+//   --filter-file F and --filter-dir D (both repeatable): every config file becomes
 //     its own independent lens in one FilterGroup; lenses combine per --groups
 //     (any = OR, default; all = AND).
 //   -f/-x RULE: CLI rules form one extra FilterSet, applied alongside (AND) the
@@ -63,7 +63,7 @@ using pmx::printable;
 //   --pid / --proc / --failed: shortcuts compiled into the CLI rule set.
 struct FilterCli {
   std::vector<const wchar_t*> files;
-  const wchar_t* dir = nullptr;
+  std::vector<const wchar_t*> dirs;
   std::vector<std::wstring> includes, excludes;
   const wchar_t* match = nullptr;
   const wchar_t* groups = nullptr;
