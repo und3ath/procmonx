@@ -36,7 +36,8 @@ Kernel Logger** ETW provider.
 - **Read & write `.pml`** — open a Procmon capture, or produce one that opens in
   real Process Monitor.
 - **Export** — native `.pmxlog`, CSV, and JSON Lines; a `summary` command for
-  quick triage.
+  quick triage. Long captures stay RAM-bounded: file output spills sorted runs to
+  disk past a configurable buffer (`pmx.json` / `--buffer-mb`).
 
 ---
 
@@ -51,13 +52,16 @@ Kernel Logger** ETW provider.
 
 ## Build
 
-From a developer command prompt (so the compiler is on `PATH`):
+```
+build.cmd test
+```
 
-```
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
+`build.cmd` sets up MSVC with Windows SDK `10.0.26100.0` (override with
+`PMX_SDK`), configures Ninja in `build\`, builds, and with `test` runs the tests.
+Pinning matters: `vcvars64` picks the newest installed SDK, and a partial SDK
+without `gdi32.lib` / `fltlib.lib` fails to link (configure stops with a hint).
+From an already-configured developer prompt, plain `cmake -S . -B build`,
+`cmake --build build`, `ctest --test-dir build` also work.
 
 Output binary: `build\src\cli\pmx.exe`. Tests build by default (`-DPMX_BUILD_TESTS=OFF`
 to skip).
@@ -104,6 +108,7 @@ src/cli       the pmx command-line tool
 tests         unit tests
 tools         check_pml.py — validates a .pml the way Process Monitor loads it
 conf/hunt     example filter "lenses" for privilege-escalation hunting (hunt.ps1)
+conf/pmx.example.json  settings template (copy next to pmx.exe as pmx.json)
 docs          DESIGN.md (architecture)
 ```
 

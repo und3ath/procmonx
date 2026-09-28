@@ -1,4 +1,17 @@
 cmake_minimum_required(VERSION 3.25)
+
+# Before project(): its compiler check links gdi32 and would die with a bare
+# LNK1104. A partial SDK (e.g. 10.0.28000.0) lacks these import libs.
+if(DEFINED ENV{WindowsSdkDir} AND DEFINED ENV{WindowsSDKLibVersion})
+  set(_pmx_sdk_lib "$ENV{WindowsSdkDir}Lib/$ENV{WindowsSDKLibVersion}um/x64")
+  foreach(_lib gdi32 fltlib)
+    if(NOT EXISTS "${_pmx_sdk_lib}/${_lib}.lib")
+      message(FATAL_ERROR "Windows SDK $ENV{WindowsSDKLibVersion} has no ${_lib}.lib. "
+        "Use build.cmd, or run: vcvars64.bat 10.0.26100.0")
+    endif()
+  endforeach()
+endif()
+
 project(procmonx VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)

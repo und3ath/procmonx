@@ -11,6 +11,8 @@ int test_filter();
 int test_store();
 int test_pid_names();
 int test_pml();
+int test_spool();
+int test_writers();
 
 int main() {
   int fails = 0;
@@ -23,6 +25,8 @@ int main() {
   fails += test_store();
   fails += test_pid_names();
   fails += test_pml();
+  fails += test_spool();
+  fails += test_writers();
   if (fails == 0) {
     std::printf("ALL TESTS PASSED\n");
     return 0;

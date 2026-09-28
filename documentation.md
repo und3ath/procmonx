@@ -32,7 +32,9 @@ pmx driver  load|unload|install|remove|attach [--name NAME] [--sys PATH]
 pmx live    [--capture proc,fs,reg|all] [--flags 0xMASK] [--rate HZ] [--count N]
             [--class C] [--hex N] [--stats] [filters] [--save F] [--csv F]
             [--pml F] [--json F|-] [--raw] [--net] [--out F] [--silent]
+            [--unfiltered] [--config F] [--buffer-mb N] [--spool-dir DIR]
 pmx net     [--count N] [--save F] [--csv F] [--pml F] [--json F|-] [--out F] [--silent]
+            [--config F] [--buffer-mb N] [--spool-dir DIR]
 pmx open    FILE.(pmxlog|pml) [filters] [--class C] [--count N]
             [--csv F] [--pml F] [--json F|-] [--summary] [--quiet]
 pmx summary FILE.(pmxlog|pml) [--by path|proc|pid|op|result|class] [--top N] [filters]
@@ -62,16 +64,20 @@ events.
 |---|---|
 | `--capture LIST` | Which classes the **driver** generates: `proc`, `fs`, `reg`, `all` (comma-separated; `proc` is always on, since process info names every event) |
 | `--flags 0xMASK` | Raw capture bitmask (default `0x7`; overrides `--capture`) |
-| `--class C` | Show/keep only this class. Without `--save`/`--pml` it also narrows the driver. `--class 5` implies `--net` |
+| `--class C` | Show/keep only this class; also narrows the driver (unless `--unfiltered` with `--save`/`--pml`). `--class 5` implies `--net` |
 | `--count N` | Stop after N events |
 | `--rate HZ` | Profiling event interval |
 | `--net` | Also capture ETW network events |
 | `--raw` | Disable request/completion pairing (show every raw record) |
 | `--stats` | Print a per-class record histogram instead of rows |
 | `--hex N` | Dump N raw detail bytes per record (debugging) |
-| `--save F` | Write the **full, unfiltered** capture to a `.pmxlog` |
-| `--pml F` | Write the **full** capture as a Process Monitor `.pml` |
-| `--csv F` / `--json F` | Write the **filtered** rows to CSV / JSON Lines |
+| `--save F` | Write the filtered capture to a `.pmxlog` |
+| `--pml F` | Write the filtered capture as a Process Monitor `.pml` |
+| `--csv F` / `--json F` | Write the filtered rows to CSV / JSON Lines |
+| `--unfiltered` | `--save`/`--pml` keep the **full** raw capture instead (console/CSV/JSON stay filtered) |
+| `--buffer-mb N` | RAM buffer for file output before spilling to disk (default 256, min 16) |
+| `--spool-dir DIR` | Where spill files go (default `%TEMP%`) |
+| `--config F` | Settings file (see §5, *Memory & spill*) |
 | `--json -` | Stream JSON Lines to stdout instead of table rows |
 | `--out F` | Also mirror console output to a file (tee) |
 | `--silent` | Suppress the console (use with `--out`) |
@@ -97,7 +103,7 @@ pmx summary cap.pml --by proc --top 10
 
 ### `pmx net`
 Network-only ETW capture, with the same `--save` / `--csv` / `--pml` / `--json` /
-`--out` / `--silent` / `--count` options.
+`--out` / `--silent` / `--count` / `--config` / `--buffer-mb` / `--spool-dir` options.
 
 ### `pmx filters FILE|DIR…`
 Inspect one or more filter configs (`.json`, or a Process Monitor `.reg` export),
@@ -166,8 +172,9 @@ is also accepted.
   `integrity`, `path`, `result`, `status` (hex), `detail`, `duration`, `image`,
   `cmdline`.
 
-`--save`/`--pml` keep the **full** capture for later re-filtering; `--csv`/`--json`
-capture the **filtered** view. Validate a generated `.pml` with
+Every output of `live` is the **filtered** view (same as `open`); add
+`--unfiltered` to keep the full capture in `--save`/`--pml` for later
+re-filtering. Validate a generated `.pml` with
 `python tools/check_pml.py FILE.pml`.
 
 ---
@@ -183,6 +190,20 @@ capture the **filtered** view. Validate a generated `.pml` with
 - **Chronological output.** Because completions arrive after their requests, saved
   and exported events are sorted by time (then sequence), matching Process
   Monitor's ordering.
+- **Memory & spill.** Events bound for a file (`--save`/`--csv`/`--json F`/
+  `--pml`) are held in a RAM buffer; when it fills, it is sorted and spilled to a
+  temp file in the spool dir (a `[pmx] buffer full: spilled run N` line is
+  printed). On stop, the runs are merged in time order straight into the output
+  files, with a `writing N/M (x%)` progress line for large captures. Temp files
+  delete themselves on close, even if `pmx` crashes. Ctrl-C once stops the capture
+  and starts the write; Ctrl-C again stops the write early — the files stay valid,
+  just shorter. Settings come from `pmx.json` next to `pmx.exe` (or `--config F`);
+  `--buffer-mb` / `--spool-dir` override it. Start from `conf/pmx.example.json`:
+  ```json
+  { "buffer_mb": 256, "spool_dir": "" }
+  ```
+  `buffer_mb` minimum 16; empty `spool_dir` = `%TEMP%`. Pick a spool dir with free
+  space about the size of the capture.
 - **Kernel-side selection.** `--capture` / `--class` choose which classes the
   driver *generates*; all rule filtering happens in user mode. Registry can be
   turned off entirely at the driver; process capture is always on because it

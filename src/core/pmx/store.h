@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "pmx/event.h"
+#include "pmx/file_io.h"
 
 namespace pmx {
 
@@ -35,5 +36,53 @@ std::string eventToJson(const Event& e);
 
 // Export events as JSON Lines (one eventToJson object per line).
 std::error_code saveEventsJson(const wchar_t* path, std::span<const Event> events);
+
+// --- Per-event record encode/decode, shared by the .pmxlog reader/writer and
+// the spool's spill files (spool.cpp). Exactly the current (kEventRecordVersion)
+// on-disk record: the bytes appendEventRecord emits are what readEventRecord at
+// that version reads back. `readEventRecord` advances `p` past the record and
+// returns false (without invalidating `e`'s already-set fields) on truncation.
+constexpr uint32_t kEventRecordVersion = 7;
+void appendEventRecord(std::string& out, const Event& e);
+bool readEventRecord(const char*& p, const char* end, uint32_t version, Event& e);
+
+// --- Streaming writers: same open/write/close/count() shape, so a caller with
+// more events than fit comfortably in RAM (see EventSpool) can drain them
+// straight to disk instead of building a second in-memory copy of the file.
+class PmxlogWriter {
+ public:
+  std::error_code open(const wchar_t* path);
+  std::error_code write(const Event& e);
+  std::error_code close();
+  uint64_t count() const { return count_; }
+
+ private:
+  BufferedFile file_;
+  uint64_t count_ = 0;
+};
+
+class CsvWriter {
+ public:
+  std::error_code open(const wchar_t* path);
+  std::error_code write(const Event& e);
+  std::error_code close();
+  uint64_t count() const { return count_; }
+
+ private:
+  BufferedFile file_;
+  uint64_t count_ = 0;
+};
+
+class JsonWriter {
+ public:
+  std::error_code open(const wchar_t* path);
+  std::error_code write(const Event& e);
+  std::error_code close();
+  uint64_t count() const { return count_; }
+
+ private:
+  BufferedFile file_;
+  uint64_t count_ = 0;
+};
 
 }  // namespace pmx

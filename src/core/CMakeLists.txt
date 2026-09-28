@@ -10,6 +10,7 @@ add_library(pmx_core STATIC
   pmx/filter_json.cpp
   pmx/filter_pmc.cpp
   pmx/store.cpp
+  pmx/spool.cpp
   pmx/pml.cpp
   pmx/pml_read.cpp
   pmx/etw/net_trace.cpp

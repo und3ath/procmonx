@@ -3,6 +3,7 @@
 // reporting, and the filter-argument plumbing used by the live / open / summary
 // commands.
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <system_error>
@@ -10,6 +11,7 @@
 
 #include "pmx/event.h"
 #include "pmx/filter.h"
+#include "pmx/spool.h"
 
 namespace pmx::cli {
 
@@ -21,6 +23,10 @@ extern std::FILE* g_outFile;   // --out target, or null
 extern bool g_silent;          // --silent: no console
 extern bool g_jsonStdout;      // --json -: stdout is JSON Lines
 extern bool g_noPause;         // --no-pause: elevated window closes on exit
+// A second Ctrl-C while a live/net capture is draining its spool to the output
+// files: stop early instead of waiting for the rest to write out. The files
+// stay valid (just short); set by main.cpp's ctrlHandler.
+extern std::atomic<bool> g_abortWrite;
 
 void writeOut(const char* s, size_t n);
 void outf(const char* fmt, ...);        // console/file stream
@@ -65,5 +71,36 @@ bool parseFilterArg(int argc, wchar_t** argv, int& i, FilterCli& fc);
 // process exit code after printing the error.
 int buildFilters(const FilterCli& fc, pmx::FilterSet& cliSet,
                  pmx::FilterGroup& lenses);
+
+// ---- Config (pmx.json) -------------------------------------------------------
+struct PmxConfig {
+  size_t bufferMb = 256;   // EventSpool RAM budget before a run spills
+  std::wstring spoolDir;   // spill dir; empty = GetTempPathW
+};
+
+// Load the RAM-buffer config. `explicitPath` (--config FILE): the file must
+// exist and parse; else <dir of pmx.exe>\pmx.json is tried: missing = defaults
+// silently, malformed = fatal either way. Returns 0, or a process exit code
+// after printing the error.
+int loadPmxConfig(const wchar_t* explicitPath, PmxConfig& out);
+
+// ---- live/net spool finalize --------------------------------------------------
+// Output file paths for a live/net capture's spool drain; null = not requested.
+struct LiveOutputPaths {
+  const wchar_t* save = nullptr;  // .pmxlog
+  const wchar_t* csv = nullptr;
+  const wchar_t* json = nullptr;  // file only - "--json -" streams live instead
+  const wchar_t* pml = nullptr;
+};
+
+// Drains `spool` into the requested output files: save/pml receive an event if
+// (tag & 1) || unfiltered, csv/json only if (tag & 1) - i.e. by default every
+// output is the filtered view; --unfiltered keeps save/pml as the full raw
+// capture. Prints a "Writing N events" status line, a throttled stderr
+// progress line for large/spilled captures, then the per-file "Saved"/"Wrote"
+// summary. Returns 0, or a process exit code after printing the error (every
+// writer is still closed, even after one fails).
+int finalizeSpool(pmx::EventSpool& spool, const LiveOutputPaths& paths,
+                  bool unfiltered);
 
 }  // namespace pmx::cli

@@ -189,9 +189,16 @@ void ensureElevated(int argc, wchar_t** argv) {
 
 BOOL WINAPI ctrlHandler(DWORD type) {
   if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
-    g_stop = true;
-    if (g_client) g_client->cancel();
-    if (g_netTrace) g_netTrace->stop();
+    // First Ctrl-C: stop capturing, let the spool drain to the output files.
+    // A second one (g_stop already set - the drain is what's taking a while)
+    // aborts that drain early; finalizeSpool still closes the files, just short.
+    if (g_stop) {
+      g_abortWrite = true;
+    } else {
+      g_stop = true;
+      if (g_client) g_client->cancel();
+      if (g_netTrace) g_netTrace->stop();
+    }
     return TRUE;
   }
   return FALSE;
@@ -659,6 +666,10 @@ int cmdLive(int argc, wchar_t** argv) {
   const wchar_t* jsonPath = nullptr;    // --json FILE|-: JSON Lines (filtered view)
   bool statsOnly = false;               // --stats: raw per-class record histogram
   bool withNet = false;                 // --net: also capture ETW network events
+  const wchar_t* configPath = nullptr;  // --config FILE
+  long long bufferMbArg = -1;           // --buffer-mb N
+  const wchar_t* spoolDirArg = nullptr; // --spool-dir DIR
+  bool unfiltered = false;              // --unfiltered: --save/--pml keep the raw capture
 
   for (int i = 0; i < argc; ++i) {
     if (parseFilterArg(argc, argv, i, fc)) continue;
@@ -694,7 +705,20 @@ int cmdLive(int argc, wchar_t** argv) {
       jsonPath = argv[++i];
     else if (!wcscmp(argv[i], L"--stats"))
       statsOnly = true;
+    else if (!wcscmp(argv[i], L"--config") && i + 1 < argc)
+      configPath = argv[++i];
+    else if (!wcscmp(argv[i], L"--buffer-mb") && i + 1 < argc)
+      bufferMbArg = wcstoll(argv[++i], nullptr, 0);
+    else if (!wcscmp(argv[i], L"--spool-dir") && i + 1 < argc)
+      spoolDirArg = argv[++i];
+    else if (!wcscmp(argv[i], L"--unfiltered"))
+      unfiltered = true;
   }
+
+  PmxConfig pmxConfig;
+  if (int rc = loadPmxConfig(configPath, pmxConfig)) return rc;
+  if (bufferMbArg >= 0) pmxConfig.bufferMb = bufferMbArg < 16 ? 16 : (size_t)bufferMbArg;
+  if (spoolDirArg) pmxConfig.spoolDir = spoolDirArg;
 
   // Build the filters: every --filter-file / --filter-dir config is its own
   // independent lens (combined per --groups, default OR), and the CLI -f/-x
@@ -703,10 +727,10 @@ int cmdLive(int argc, wchar_t** argv) {
   pmx::FilterGroup dirFilters;
   if (int rc = buildFilters(fc, filters, dirFilters)) return rc;
 
-  // Kernel-side class selection. --save/--pml normally keep the full capture
-  // for offline re-filtering, so --class alone only narrows the driver when
-  // nothing is being saved; --capture narrows it explicitly.
-  const bool keepAll = savePath || pmlPath;
+  // Kernel-side class selection. Every output is the filtered view, so --class
+  // narrows the driver unless --unfiltered keeps the raw capture in
+  // --save/--pml. --capture narrows it explicitly.
+  const bool keepAll = unfiltered && (savePath || pmlPath);
   uint32_t flags = pmx::proto::kCaptureDefault;
   if (rawFlags) {
     flags = static_cast<uint32_t>(wcstoul(rawFlags, nullptr, 0));
@@ -766,9 +790,21 @@ int cmdLive(int argc, wchar_t** argv) {
 
   pmx::ProcessTable procs;
   pmx::Pairer pairer;
-  std::vector<pmx::Event> saved;  // --save: the full unfiltered capture
-  std::vector<pmx::Event> shown;  // --csv: only the filtered (displayed) rows
   long long n = 0;
+
+  // File outputs go through a RAM-bounded spool (sorted runs spill to disk).
+  std::optional<pmx::EventSpool> spool;
+  if (savePath || csvPath || jsonFile || pmlPath) {
+    pmx::SpoolOptions sopt;
+    sopt.bufferBytes = pmxConfig.bufferMb << 20;
+    sopt.dir = pmxConfig.spoolDir;
+    spool.emplace(sopt);
+    spool->onSpill = [](size_t idx, uint64_t cnt) {
+      statusf("[pmx] buffer full: spilled run %zu (%llu events) to disk\n",
+             idx, (unsigned long long)cnt);
+    };
+  }
+  bool spoolErrorPrinted = false;
 
   // The driver pump and (with --net) the ETW network thread both feed events;
   // serialize the shared store/print/count under one lock.
@@ -779,12 +815,22 @@ int cmdLive(int argc, wchar_t** argv) {
     // Hard cap: once the count is met, drop everything (both threads, in-flight
     // driver batches and buffered network events) so --count doesn't overshoot.
     if (maxCount > 0 && n >= maxCount) return;
-    if (savePath || pmlPath)
-      saved.push_back(ev);  // .pmxlog/.pml keep everything for offline re-filtering
-    if (classFilter >= 0 && ev.eventClass != classFilter) return;
-    if (!filters.matches(ev)) return;
-    if (!dirFilters.matches(ev)) return;
-    if (csvPath || jsonFile) shown.push_back(ev);  // CSV/JSON = filtered view
+    const bool pass = (classFilter < 0 || ev.eventClass == classFilter) &&
+                      filters.matches(ev) && dirFilters.matches(ev);
+    if (!pass && !keepAll) return;
+    if (spool) {
+      if (std::error_code se = spool->add(ev, pass ? 1 : 0)) {
+        if (!spoolErrorPrinted) {
+          printError("spool", se);
+          spoolErrorPrinted = true;
+        }
+        g_stop = true;
+        client.cancel();
+        netTrace.stop();
+        return;
+      }
+    }
+    if (!pass) return;
 
     if (g_jsonStdout)
       writeJsonRow(ev);
@@ -884,50 +930,15 @@ int cmdLive(int argc, wchar_t** argv) {
     return 0;
   }
   statusf("Captured %lld events.\n", n);
-  // The driver and (with --net) the ETW network thread arrive independently, so
-  // the saved buffers are in arrival order. Both timestamps are FILETIME (100ns),
-  // so stable-sort by time gives a Procmon-like chronological file.
-  // Even without --net the order is not chronological: the Pairer emits each
-  // request when its completion arrives. Always sort.
-  {
-    auto byTime = [](const pmx::Event& a, const pmx::Event& b) {
-      if (a.timestamp != b.timestamp) return a.timestamp < b.timestamp;
-      return a.sequence < b.sequence;
-    };
-    std::stable_sort(saved.begin(), saved.end(), byTime);
-    std::stable_sort(shown.begin(), shown.end(), byTime);
-  }
-  if (savePath) {
-    std::error_code se = pmx::saveEvents(savePath, saved);
-    if (se) {
-      printError("save", se);
-      return 5;
-    }
-    statusf("Saved %zu events to %ls\n", saved.size(), savePath);
-  }
-  if (csvPath) {
-    std::error_code se = pmx::saveEventsCsv(csvPath, shown);
-    if (se) {
-      printError("csv", se);
-      return 5;
-    }
-    statusf("Wrote %zu events to %ls\n", shown.size(), csvPath);
-  }
-  if (jsonFile) {
-    std::error_code je = pmx::saveEventsJson(jsonPath, shown);
-    if (je) {
-      printError("json", je);
-      return 5;
-    }
-    statusf("Wrote %zu events to %ls\n", shown.size(), jsonPath);
-  }
-  if (pmlPath) {
-    std::error_code pe = pmx::savePml(pmlPath, saved);
-    if (pe) {
-      printError("pml", pe);
-      return 5;
-    }
-    statusf("Wrote %zu events to %ls\n", saved.size(), pmlPath);
+  // Arrival order isn't chronological (the Pairer emits on completion; --net
+  // interleaves ETW), so the spool drains sorted by (timestamp, sequence).
+  if (spool) {
+    LiveOutputPaths paths;
+    paths.save = savePath;
+    paths.csv = csvPath;
+    paths.json = jsonFile ? jsonPath : nullptr;
+    paths.pml = pmlPath;
+    if (int rc = finalizeSpool(*spool, paths, unfiltered)) return rc;
   }
   if (g_outFile) { std::fclose(g_outFile); g_outFile = nullptr; }
   return 0;
@@ -941,6 +952,9 @@ int cmdNet(int argc, wchar_t** argv) {
   const wchar_t* csvPath = nullptr;
   const wchar_t* pmlPath = nullptr;
   const wchar_t* jsonPath = nullptr;
+  const wchar_t* configPath = nullptr;
+  long long bufferMbArg = -1;
+  const wchar_t* spoolDirArg = nullptr;
   for (int i = 0; i < argc; ++i) {
     if (!wcscmp(argv[i], L"--count") && i + 1 < argc)
       maxCount = wcstoull(argv[++i], nullptr, 0);
@@ -954,12 +968,24 @@ int cmdNet(int argc, wchar_t** argv) {
       csvPath = argv[++i];
     else if (!wcscmp(argv[i], L"--pml") && i + 1 < argc)
       pmlPath = argv[++i];
+    else if (!wcscmp(argv[i], L"--config") && i + 1 < argc)
+      configPath = argv[++i];
+    else if (!wcscmp(argv[i], L"--buffer-mb") && i + 1 < argc)
+      bufferMbArg = wcstoll(argv[++i], nullptr, 0);
+    else if (!wcscmp(argv[i], L"--spool-dir") && i + 1 < argc)
+      spoolDirArg = argv[++i];
     else if (!wcscmp(argv[i], L"--silent"))
       g_silent = true;
   }
 
+  PmxConfig pmxConfig;
+  if (int rc = loadPmxConfig(configPath, pmxConfig)) return rc;
+  if (bufferMbArg >= 0) pmxConfig.bufferMb = bufferMbArg < 16 ? 16 : (size_t)bufferMbArg;
+  if (spoolDirArg) pmxConfig.spoolDir = spoolDirArg;
+
   SetConsoleOutputCP(CP_UTF8);
   g_jsonStdout = jsonPath && !wcscmp(jsonPath, L"-");
+  const bool jsonFile = jsonPath && !g_jsonStdout;
   if (outPath) {
     g_outFile = _wfopen(outPath, L"w");
     if (!g_outFile) {
@@ -975,7 +1001,21 @@ int cmdNet(int argc, wchar_t** argv) {
 
   statusf("Starting NT Kernel Logger (network). Ctrl-C to stop.\n");
 
-  std::vector<pmx::Event> events;
+  // net has no filtering, so every event is tag 1 (the "filtered" view) -
+  // every output gets the same events.
+  std::optional<pmx::EventSpool> spool;
+  if (savePath || csvPath || jsonFile || pmlPath) {
+    pmx::SpoolOptions sopt;
+    sopt.bufferBytes = pmxConfig.bufferMb << 20;
+    sopt.dir = pmxConfig.spoolDir;
+    spool.emplace(sopt);
+    spool->onSpill = [](size_t idx, uint64_t cnt) {
+      statusf("[pmx] buffer full: spilled run %zu (%llu events) to disk\n",
+             idx, (unsigned long long)cnt);
+    };
+  }
+  bool spoolErrorPrinted = false;
+
   long long n = 0;
   std::error_code ec = trace.run(
       [&](const pmx::NetEvent& nev) {
@@ -983,12 +1023,21 @@ int cmdNet(int argc, wchar_t** argv) {
         // drop anything past maxCount to keep --count exact.
         if (maxCount && (uint64_t)n >= maxCount) return;
         pmx::Event ev = netEventToEvent(nev);
+        if (spool) {
+          if (std::error_code se = spool->add(ev, 1)) {
+            if (!spoolErrorPrinted) {
+              printError("spool", se);
+              spoolErrorPrinted = true;
+            }
+            trace.stop();
+            return;
+          }
+        }
         if (g_jsonStdout)
           writeJsonRow(ev);
         else
           printRow(n, ev);
         ++n;
-        events.push_back(std::move(ev));
       },
       maxCount);
   if (ec) {
@@ -998,29 +1047,13 @@ int cmdNet(int argc, wchar_t** argv) {
     return 3;
   }
   statusf("Captured %lld network events.\n", n);
-  std::stable_sort(events.begin(), events.end(),
-                   [](const pmx::Event& a, const pmx::Event& b) {
-                     return a.timestamp < b.timestamp;
-                   });
-  if (savePath) {
-    std::error_code se = pmx::saveEvents(savePath, events);
-    if (se) { printError("save", se); return 5; }
-    statusf("Saved %zu events to %ls\n", events.size(), savePath);
-  }
-  if (csvPath) {
-    std::error_code se = pmx::saveEventsCsv(csvPath, events);
-    if (se) { printError("csv", se); return 5; }
-    statusf("Wrote %zu events to %ls\n", events.size(), csvPath);
-  }
-  if (jsonPath && !g_jsonStdout) {
-    std::error_code je = pmx::saveEventsJson(jsonPath, events);
-    if (je) { printError("json", je); return 5; }
-    statusf("Wrote %zu events to %ls\n", events.size(), jsonPath);
-  }
-  if (pmlPath) {
-    std::error_code pe = pmx::savePml(pmlPath, events);
-    if (pe) { printError("pml", pe); return 5; }
-    statusf("Wrote %zu events to %ls\n", events.size(), pmlPath);
+  if (spool) {
+    LiveOutputPaths paths;
+    paths.save = savePath;
+    paths.csv = csvPath;
+    paths.json = jsonFile ? jsonPath : nullptr;
+    paths.pml = pmlPath;
+    if (int rc = finalizeSpool(*spool, paths, /*unfiltered=*/false)) return rc;
   }
   if (g_outFile) { std::fclose(g_outFile); g_outFile = nullptr; }
   return 0;
@@ -1098,14 +1131,24 @@ void usage() {
       "           [--match procmon|any] [--groups any|all]\n"
       "           [--pid N] [--proc NAME] [--failed]\n"
       "           [--save FILE] [--csv FILE] [--pml OUT.pml] [--json FILE|-] [--raw] [--net]\n"
-      "           [--out FILE] [--silent]\n"
+      "           [--out FILE] [--silent] [--unfiltered]\n"
       "           [--capture proc,fs,reg|all]\n"
+      "           [--config FILE] [--buffer-mb N] [--spool-dir DIR]\n"
       "           classes: 1=Process 2=Registry 3=FileSystem 4=Profiling 5=Network 6=IPC 0=Completion\n"
       "           --capture picks what the DRIVER generates (kernel-side; proc is always\n"
-      "           on for process names). --class alone also narrows the driver unless\n"
-      "           --save/--pml keep the full capture. --flags sets the raw mask.\n"
+      "           on for process names). --class narrows the driver and every output\n"
+      "           (console/--csv/--json/--save/--pml alike are all the filtered view by\n"
+      "           default). --unfiltered keeps --save/--pml as the full raw capture;\n"
+      "           --csv/--json/console stay filtered either way.\n"
+      "           --flags sets the raw mask.\n"
       "           --net also captures ETW network events (TCP/UDP)\n"
       "           --out tees console output to FILE; --silent suppresses the console\n"
+      "           events bound for a file are buffered in RAM up to --buffer-mb (or the\n"
+      "           config's buffer_mb, default 256) before spilling a sorted run to disk\n"
+      "           (--spool-dir, default %%TEMP%%) - keeps a long capture from filling RAM.\n"
+      "           Ctrl-C stops the capture and starts writing files; a second Ctrl-C\n"
+      "           while that write is in progress aborts it early (files stay valid,\n"
+      "           just short).\n"
       "  pmx open FILE.(pmxlog|pml) [-f RULE] [-x RULE] [--filter-file cfg]... [--filter-dir DIR]\n"
       "           [--match procmon|any] [--groups any|all] [--pid N] [--proc NAME] [--failed]\n"
       "           [--class C] [--count N] [--csv OUT.csv] [--pml OUT.pml] [--json FILE|-]\n"
@@ -1114,11 +1157,16 @@ void usage() {
       "           [filters as for open]      counts per key, most frequent first\n"
       "  pmx filters FILE|DIR...           inspect filter config(s)\n"
       "  pmx net [--count N] [--out F][--silent][--save F][--csv F][--pml F][--json F|-]\n"
+      "          [--config FILE] [--buffer-mb N] [--spool-dir DIR]\n"
       "           network only (ETW; admin)\n"
       "  pmx elevate <args...>     relaunch elevated (UAC) explicitly\n"
       "  (driver/live/net auto-elevate via UAC when not already admin; the\n"
       "   elevated window stays open until a key is pressed; add --no-pause to\n"
       "   auto-close it)\n"
+      "  config (live/net): --config FILE requires that file to exist and parse; else\n"
+      "    <dir of pmx.exe>\\pmx.json is used if present (missing = defaults, malformed\n"
+      "    = error). Keys: \"buffer_mb\" (int, clamped >= 16), \"spool_dir\" (string).\n"
+      "    --buffer-mb/--spool-dir on the command line override the config file.\n"
       "  filtering (live/open):\n"
       "    --filter-file F (repeatable) / --filter-dir D: each file = an independent\n"
       "      lens with its own includes/excludes; lenses OR'd (--groups any, default)\n"

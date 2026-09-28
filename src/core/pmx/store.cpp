@@ -100,56 +100,141 @@ struct Reader {
 };
 }  // namespace
 
-std::error_code saveEvents(const wchar_t* path, std::span<const Event> events) {
-  std::string b;
-  b.reserve(events.size() * 128 + 16);
-  putU32(b, kMagic);
-  putU32(b, kVersion);
-  putU32(b, (uint32_t)events.size());
-  putU32(b, 0);  // reserved
-  for (const Event& e : events) {
-    putU32(b, e.sequence);
-    putU64(b, e.timestamp);
-    putU32(b, e.processIndex);
-    putU32(b, e.pid);
-    putU32(b, e.parentPid);
-    putU32(b, e.eventClass);
-    putU32(b, e.operation);
-    putU32(b, e.result);
-    putU64(b, e.information);
-    putU64(b, e.duration);
-    putU32(b, e.completed ? 1u : 0u);
-    putStrW(b, e.processName);
-    putStrW(b, e.imagePath);
-    putStrW(b, e.commandLine);
-    putStrW(b, e.user);
-    putStrW(b, e.integrity);
-    putStrA(b, e.opName);
-    putStrA(b, e.className);
-    putStrW(b, e.path);
-    putStrW(b, e.detail);
-    putU32(b, e.desiredAccess);
-    putU32(b, e.regType);
-    putU32(b, e.regLength);
-    putBytes(b, e.valueData);
-    putU32(b, e.fsDisposition);
-    putU32(b, e.fsOptions);
-    putU32(b, e.fsAllocation);
-    putU32(b, e.fsAttributes);
-    putU32(b, e.fsShareMode);
-    putU64(b, e.ioOffset);
-    putU32(b, e.ioLength);
-    putU32(b, e.tid);
-    b.append(reinterpret_cast<const char*>(e.netSrcIp), 16);
-    b.append(reinterpret_cast<const char*>(e.netDstIp), 16);
-    putU32(b, e.netSrcPort);
-    putU32(b, e.netDstPort);
-    putU32(b, e.netFlags);
-    putU32(b, e.targetPid);
-    putStrW(b, e.targetCmdline);
-    putU32(b, e.fsSubOp);
+void appendEventRecord(std::string& b, const Event& e) {
+  putU32(b, e.sequence);
+  putU64(b, e.timestamp);
+  putU32(b, e.processIndex);
+  putU32(b, e.pid);
+  putU32(b, e.parentPid);
+  putU32(b, e.eventClass);
+  putU32(b, e.operation);
+  putU32(b, e.result);
+  putU64(b, e.information);
+  putU64(b, e.duration);
+  putU32(b, e.completed ? 1u : 0u);
+  putStrW(b, e.processName);
+  putStrW(b, e.imagePath);
+  putStrW(b, e.commandLine);
+  putStrW(b, e.user);
+  putStrW(b, e.integrity);
+  putStrA(b, e.opName);
+  putStrA(b, e.className);
+  putStrW(b, e.path);
+  putStrW(b, e.detail);
+  putU32(b, e.desiredAccess);
+  putU32(b, e.regType);
+  putU32(b, e.regLength);
+  putBytes(b, e.valueData);
+  putU32(b, e.fsDisposition);
+  putU32(b, e.fsOptions);
+  putU32(b, e.fsAllocation);
+  putU32(b, e.fsAttributes);
+  putU32(b, e.fsShareMode);
+  putU64(b, e.ioOffset);
+  putU32(b, e.ioLength);
+  putU32(b, e.tid);
+  b.append(reinterpret_cast<const char*>(e.netSrcIp), 16);
+  b.append(reinterpret_cast<const char*>(e.netDstIp), 16);
+  putU32(b, e.netSrcPort);
+  putU32(b, e.netDstPort);
+  putU32(b, e.netFlags);
+  putU32(b, e.targetPid);
+  putStrW(b, e.targetCmdline);
+  putU32(b, e.fsSubOp);
+}
+
+bool readEventRecord(const char*& p, const char* end, uint32_t version, Event& e) {
+  Reader r{p, end};
+  e.sequence = r.u32();
+  e.timestamp = r.u64();
+  e.processIndex = r.u32();
+  e.pid = r.u32();
+  e.parentPid = r.u32();
+  e.eventClass = (uint16_t)r.u32();
+  e.operation = (uint16_t)r.u32();
+  e.result = r.u32();
+  e.information = r.u64();
+  e.duration = r.u64();
+  e.completed = r.u32() != 0;
+  e.processName = r.strW();
+  e.imagePath = r.strW();
+  e.commandLine = r.strW();
+  e.user = r.strW();
+  e.integrity = r.strW();
+  e.opName = r.strA();
+  e.className = r.strA();
+  e.path = r.strW();
+  e.detail = r.strW();
+  if (version >= 2) {
+    e.desiredAccess = r.u32();
+    e.regType = r.u32();
+    e.regLength = r.u32();
+    e.valueData = r.bytes();
   }
-  return writeWholeFile(path, b.data(), b.size());
+  if (version >= 3) {
+    e.fsDisposition = r.u32();
+    e.fsOptions = r.u32();
+    e.fsAllocation = r.u32();
+    e.fsAttributes = (uint16_t)r.u32();
+    e.fsShareMode = (uint16_t)r.u32();
+    e.ioOffset = r.u64();
+    e.ioLength = r.u32();
+  }
+  if (version >= 4) e.tid = r.u32();
+  if (version >= 5) {
+    r.raw(e.netSrcIp, 16);
+    r.raw(e.netDstIp, 16);
+    e.netSrcPort = (uint16_t)r.u32();
+    e.netDstPort = (uint16_t)r.u32();
+    e.netFlags = (uint8_t)r.u32();
+  }
+  if (version >= 6) {
+    e.targetPid = r.u32();
+    e.targetCmdline = r.strW();
+  }
+  if (version >= 7) {
+    e.fsSubOp = (uint8_t)r.u32();
+  } else if (e.eventClass == 3 || e.eventClass == 6) {
+    // Pre-v7 logs didn't keep the raw byte: recover it from the refined op
+    // name decode produced (e.g. "QueryNameInformationFile" -> 9).
+    e.fsSubOp = proto::fileSubOpFromName(e.operation, e.opName.c_str());
+  }
+  p = r.p;
+  return r.ok;
+}
+
+std::error_code PmxlogWriter::open(const wchar_t* path) {
+  if (std::error_code ec = file_.open(path)) return ec;
+  count_ = 0;
+  uint32_t hdr[4] = {kMagic, kVersion, 0, 0};
+  return file_.write(hdr, sizeof hdr);
+}
+
+std::error_code PmxlogWriter::write(const Event& e) {
+  if (count_ >= UINT32_MAX) return errc(ERROR_FILE_TOO_LARGE);
+  std::string rec;
+  appendEventRecord(rec, e);
+  if (std::error_code ec = file_.write(rec.data(), rec.size())) return ec;
+  ++count_;
+  return {};
+}
+
+std::error_code PmxlogWriter::close() {
+  uint32_t count32 = (uint32_t)count_;
+  if (std::error_code ec = file_.patch(8, &count32, 4)) return ec;
+  return file_.close();
+}
+
+std::error_code saveEvents(const wchar_t* path, std::span<const Event> events) {
+  PmxlogWriter w;
+  if (std::error_code ec = w.open(path)) return ec;
+  for (const Event& e : events) {
+    if (std::error_code ec = w.write(e)) {
+      w.close();
+      return ec;
+    }
+  }
+  return w.close();
 }
 
 namespace {
@@ -176,37 +261,65 @@ std::string timeOfDay(uint64_t filetime) {
 }
 }  // namespace
 
+namespace {
+constexpr char kCsvHeader[] =
+    "\"Time of Day\",\"Process Name\",\"PID\",\"User\",\"Integrity\","
+    "\"Operation\",\"Path\",\"Result\",\"Detail\",\"Duration\"\r\n";
+
+void appendCsvRow(std::string& b, const Event& e) {
+  csvField(b, timeOfDay(e.timestamp));
+  b.push_back(',');
+  csvField(b, wToUtf8(e.processName));
+  b.push_back(',');
+  csvField(b, std::to_string(e.pid));
+  b.push_back(',');
+  csvField(b, wToUtf8(e.user));
+  b.push_back(',');
+  csvField(b, wToUtf8(e.integrity));
+  b.push_back(',');
+  csvField(b, e.opName);
+  b.push_back(',');
+  csvField(b, wToUtf8(e.path));
+  b.push_back(',');
+  csvField(b, statusName(e.result));
+  b.push_back(',');
+  csvField(b, wToUtf8(e.detail));
+  b.push_back(',');
+  char dur[32] = "";
+  if (e.duration)
+    std::snprintf(dur, sizeof dur, "%.7f", (double)e.duration / 1e7);
+  csvField(b, dur);
+  b.append("\r\n");
+}
+}  // namespace
+
+std::error_code CsvWriter::open(const wchar_t* path) {
+  if (std::error_code ec = file_.open(path)) return ec;
+  count_ = 0;
+  return file_.write(kCsvHeader, sizeof(kCsvHeader) - 1);
+}
+
+std::error_code CsvWriter::write(const Event& e) {
+  std::string row;
+  appendCsvRow(row, e);
+  if (std::error_code ec = file_.write(row.data(), row.size())) return ec;
+  ++count_;
+  return {};
+}
+
+std::error_code CsvWriter::close() { return file_.close(); }
+
 std::error_code saveEventsCsv(const wchar_t* path,
                               std::span<const Event> events) {
-  std::string b =
-      "\"Time of Day\",\"Process Name\",\"PID\",\"User\",\"Integrity\","
-      "\"Operation\",\"Path\",\"Result\",\"Detail\",\"Duration\"\r\n";
+  CsvWriter w;
+  if (std::error_code ec = w.open(path)) return ec;
   for (const Event& e : events) {
-    csvField(b, timeOfDay(e.timestamp));
-    b.push_back(',');
-    csvField(b, wToUtf8(e.processName));
-    b.push_back(',');
-    csvField(b, std::to_string(e.pid));
-    b.push_back(',');
-    csvField(b, wToUtf8(e.user));
-    b.push_back(',');
-    csvField(b, wToUtf8(e.integrity));
-    b.push_back(',');
-    csvField(b, e.opName);
-    b.push_back(',');
-    csvField(b, wToUtf8(e.path));
-    b.push_back(',');
-    csvField(b, statusName(e.result));
-    b.push_back(',');
-    csvField(b, wToUtf8(e.detail));
-    b.push_back(',');
-    char dur[32] = "";
-    if (e.duration)
-      std::snprintf(dur, sizeof dur, "%.7f", (double)e.duration / 1e7);
-    csvField(b, dur);
-    b.append("\r\n");
+    if (std::error_code ec = w.write(e)) {
+      w.close();
+      return ec;
+    }
   }
-  return writeWholeFile(path, b.data(), b.size());
+  return w.close();
 }
 
 namespace {
@@ -283,14 +396,32 @@ std::string eventToJson(const Event& e) {
   return o;
 }
 
+std::error_code JsonWriter::open(const wchar_t* path) {
+  count_ = 0;
+  return file_.open(path);
+}
+
+std::error_code JsonWriter::write(const Event& e) {
+  std::string line = eventToJson(e);
+  line += '\n';
+  if (std::error_code ec = file_.write(line.data(), line.size())) return ec;
+  ++count_;
+  return {};
+}
+
+std::error_code JsonWriter::close() { return file_.close(); }
+
 std::error_code saveEventsJson(const wchar_t* path,
                                std::span<const Event> events) {
-  std::string b;
+  JsonWriter w;
+  if (std::error_code ec = w.open(path)) return ec;
   for (const Event& e : events) {
-    b += eventToJson(e);
-    b += '\n';
+    if (std::error_code ec = w.write(e)) {
+      w.close();
+      return ec;
+    }
   }
-  return writeWholeFile(path, b.data(), b.size());
+  return w.close();
 }
 
 std::error_code loadEvents(const wchar_t* path, std::vector<Event>& out) {
@@ -308,65 +439,13 @@ std::error_code loadEvents(const wchar_t* path, std::vector<Event>& out) {
   // can't trigger a multi-GB allocation.
   const size_t maxByBytes = buf.size() / 64;
   out.reserve(out.size() + (count < maxByBytes ? count : maxByBytes));
-  for (uint32_t i = 0; i < count && r.ok; ++i) {
+  const char* p = r.p;
+  const char* end = r.end;
+  for (uint32_t i = 0; i < count; ++i) {
     Event e;
-    e.sequence = r.u32();
-    e.timestamp = r.u64();
-    e.processIndex = r.u32();
-    e.pid = r.u32();
-    e.parentPid = r.u32();
-    e.eventClass = (uint16_t)r.u32();
-    e.operation = (uint16_t)r.u32();
-    e.result = r.u32();
-    e.information = r.u64();
-    e.duration = r.u64();
-    e.completed = r.u32() != 0;
-    e.processName = r.strW();
-    e.imagePath = r.strW();
-    e.commandLine = r.strW();
-    e.user = r.strW();
-    e.integrity = r.strW();
-    e.opName = r.strA();
-    e.className = r.strA();
-    e.path = r.strW();
-    e.detail = r.strW();
-    if (version >= 2) {
-      e.desiredAccess = r.u32();
-      e.regType = r.u32();
-      e.regLength = r.u32();
-      e.valueData = r.bytes();
-    }
-    if (version >= 3) {
-      e.fsDisposition = r.u32();
-      e.fsOptions = r.u32();
-      e.fsAllocation = r.u32();
-      e.fsAttributes = (uint16_t)r.u32();
-      e.fsShareMode = (uint16_t)r.u32();
-      e.ioOffset = r.u64();
-      e.ioLength = r.u32();
-    }
-    if (version >= 4) e.tid = r.u32();
-    if (version >= 5) {
-      r.raw(e.netSrcIp, 16);
-      r.raw(e.netDstIp, 16);
-      e.netSrcPort = (uint16_t)r.u32();
-      e.netDstPort = (uint16_t)r.u32();
-      e.netFlags = (uint8_t)r.u32();
-    }
-    if (version >= 6) {
-      e.targetPid = r.u32();
-      e.targetCmdline = r.strW();
-    }
-    if (version >= 7) {
-      e.fsSubOp = (uint8_t)r.u32();
-    } else if (e.eventClass == 3 || e.eventClass == 6) {
-      // Pre-v7 logs didn't keep the raw byte: recover it from the refined op
-      // name decode produced (e.g. "QueryNameInformationFile" -> 9).
-      e.fsSubOp = proto::fileSubOpFromName(e.operation, e.opName.c_str());
-    }
-    if (r.ok) out.push_back(std::move(e));
+    if (!readEventRecord(p, end, version, e)) return errc(ERROR_INVALID_DATA);
+    out.push_back(std::move(e));
   }
-  if (!r.ok) return errc(ERROR_INVALID_DATA);
   return {};
 }
 

@@ -35,27 +35,6 @@ void putW(std::vector<uint8_t>& b, const std::wstring& s) {
   b.insert(b.end(), p, p + s.size() * 2);
 }
 
-// Patch helpers for writing into the already-reserved header region.
-void patchBytes(std::vector<uint8_t>& b, size_t off, const void* data,
-                size_t n) {
-  std::memcpy(b.data() + off, data, n);
-}
-void patchU32(std::vector<uint8_t>& b, size_t off, uint32_t v) {
-  patchBytes(b, off, &v, 4);
-}
-void patchU64(std::vector<uint8_t>& b, size_t off, uint64_t v) {
-  patchBytes(b, off, &v, 8);
-}
-// Writes `s` as UTF-16LE into a fixed-size (in wchar_t units) NUL-padded
-// field, truncating to fieldWchars-1 code units + NUL if too long.
-void patchWFixed(std::vector<uint8_t>& b, size_t off, const std::wstring& s,
-                 size_t fieldWchars) {
-  std::wstring t = s;
-  if (t.size() > fieldWchars - 1) t.resize(fieldWchars - 1);
-  patchBytes(b, off, t.data(), t.size() * 2);
-  // Remaining bytes in the field are already zero from buf.resize().
-}
-
 // Process-table struct fields, in exact on-disk order (matches how Procmon
 // writes it and procmon-parser reads it):
 //   u32 process_index, u32 pid, u32 parent_pid,                = 12
@@ -345,6 +324,282 @@ bool procResolved(const Event& ev) {
 
 }  // namespace
 
+// PmlWriter streams the same layout savePml used to build in one giant
+// in-memory buffer, so a long capture doesn't need a second full copy of the
+// file just to write it. Section order matches real Procmon files: readers
+// (procmon-parser) infer each section's size from the *next* section's
+// offset, so events -> events offset array -> process table -> strings ->
+// icons -> hosts must land adjacent and in this order - which streaming
+// naturally gives us, since each section is only known once the previous one
+// is flushed.
+struct PmlWriter::Impl {
+  BufferedFile file;
+  std::vector<uint64_t> eventOffsets;  // one per write()'d (pmlWritable) event
+
+  // String interning (process fields only), same as the old Step A.
+  std::vector<std::wstring> strings;
+  std::unordered_map<std::wstring, uint32_t> stringIndex;
+  uint32_t intern(const std::wstring& s) {
+    auto it = stringIndex.find(s);
+    if (it != stringIndex.end()) return it->second;
+    uint32_t id = (uint32_t)strings.size();
+    strings.push_back(s);
+    stringIndex.emplace(s, id);
+    return id;
+  }
+
+  // Distinct processes, first-seen order (old Step B). A record first built
+  // from an unresolved event ("idx#N", pid 0) is replaced by the first
+  // resolved event for the same index. Safe to update per event as they
+  // stream in, since it never depends on any later event.
+  std::vector<ProcRec> processes;
+  std::unordered_map<uint32_t, size_t> seenProcIdx;  // processIndex -> slot
+  std::vector<bool> slotResolved;
+  void updateProcessTable(const Event& ev) {
+    auto seen = seenProcIdx.find(ev.processIndex);
+    const bool resolved = procResolved(ev);
+    if (seen != seenProcIdx.end() &&
+        (slotResolved[seen->second] || !resolved))
+      return;
+    ProcRec pr;
+    pr.idx = ev.processIndex;
+    pr.pid = ev.pid;
+    pr.ppid = ev.parentPid;
+    pr.integrity = intern(ev.integrity);
+    pr.user = intern(ev.user);
+    pr.processName = intern(ev.processName);
+    pr.imagePath = intern(ev.imagePath);
+    pr.cmdline = intern(ev.commandLine);
+    pr.company = intern(L"");
+    pr.version = intern(L"");
+    pr.description = intern(L"");
+    if (seen != seenProcIdx.end()) {
+      processes[seen->second] = pr;
+      slotResolved[seen->second] = true;
+      return;
+    }
+    seenProcIdx.emplace(ev.processIndex, processes.size());
+    processes.push_back(pr);
+    slotResolved.push_back(resolved);
+  }
+};
+
+PmlWriter::PmlWriter() : impl_(std::make_unique<Impl>()) {}
+PmlWriter::~PmlWriter() = default;
+
+std::error_code PmlWriter::open(const wchar_t* path) {
+  Impl& im = *impl_;
+  if (std::error_code ec = im.file.open(path)) return ec;
+  std::vector<uint8_t> zero(0x3A8, 0);  // header, patched in close()
+  if (std::error_code ec = im.file.write(zero.data(), zero.size())) return ec;
+  im.intern(L"");  // index 0 = empty string
+  return {};
+}
+
+std::error_code PmlWriter::write(const Event& ev) {
+  if (!pmlWritable(ev)) return {};
+  Impl& im = *impl_;
+  im.updateProcessTable(ev);
+
+  const uint64_t offset = im.file.tell();
+  // Offsets are 40-bit (u32 low + u8 high, see the offset array below).
+  if (offset >= (uint64_t{1} << 40)) return errc(ERROR_FILE_TOO_LARGE);
+
+  // Build the operation-specific detail blob (fixed 0x34-byte event header,
+  // no stacks).
+  std::vector<uint8_t> detail;
+  if (ev.eventClass == 2) appendRegDetail(detail, ev);
+  else if (ev.eventClass == 3 || ev.eventClass == 6) appendFsDetail(detail, ev);
+  else if (ev.eventClass == 1) {
+    if (ev.operation == 0 || ev.operation == 1) {
+      // The process the record DESCRIBES (for Process Create: the child, not
+      // the creator). Pre-v6 logs lack target*: fall back to the event's own
+      // process, which is right for op 0.
+      const bool haveTarget = ev.targetPid != 0 || !ev.targetCmdline.empty();
+      appendProcessDetail(detail, ev.operation,
+                          haveTarget ? ev.path : ev.imagePath,
+                          haveTarget ? ev.targetCmdline : ev.commandLine,
+                          haveTarget ? ev.targetPid : ev.pid);
+    } else {
+      appendProcessDetail(detail, ev.operation, ev.path.empty() ? ev.imagePath : ev.path,
+                          ev.commandLine, ev.pid);
+    }
+  }
+  else if (ev.eventClass == 5) appendNetworkDetail(detail, ev);
+  else if (ev.eventClass == 4) appendProfilingDetail(detail, ev.operation);
+  std::vector<uint8_t> extra = buildExtraDetails(ev);
+  // The reader finds the extra blob at extra_detail_offset counted from the
+  // event start; with no stack frames it sits right after the details as
+  // [u16 size][bytes], so the offset is 0x34 + detail size.
+  const uint32_t extraOff =
+      extra.empty() ? 0u : (uint32_t)(0x34 + detail.size());
+
+  std::vector<uint8_t> rec;
+  rec.reserve(0x34 + detail.size() + (extra.empty() ? 0 : 2 + extra.size()));
+  putU32(rec, ev.processIndex);
+  putU32(rec, ev.tid);            // thread_id
+  putU32(rec, ev.eventClass);
+  putU16(rec, ev.operation);
+  putZeros(rec, 6);
+  putU64(rec, ev.duration);
+  putU64(rec, ev.timestamp);
+  putU32(rec, ev.result);
+  putU16(rec, 0);                 // stack_depth
+  putU16(rec, 0);                 // zero
+  putU32(rec, (uint32_t)detail.size());  // detail_size
+  putU32(rec, extraOff);          // extra_detail_offset
+  rec.insert(rec.end(), detail.begin(), detail.end());
+  if (!extra.empty()) {
+    putU16(rec, (uint16_t)extra.size());
+    rec.insert(rec.end(), extra.begin(), extra.end());
+  }
+  if (std::error_code ec = im.file.write(rec.data(), rec.size())) return ec;
+  im.eventOffsets.push_back(offset);
+  return {};
+}
+
+std::error_code PmlWriter::close() {
+  Impl& im = *impl_;
+
+  // Events offset array ({u32 offset low32, u8 offset bits 32..39} per
+  // event; pml_read.cpp reads it the same way). Below 4 GB the high byte is
+  // 0, same as the old fixed "flags" byte this replaces.
+  const uint64_t eventsOffsetArrayOffset = im.file.tell();
+  for (uint64_t off : im.eventOffsets) {
+    const uint32_t low = (uint32_t)(off & 0xFFFFFFFFull);
+    const uint8_t high = (uint8_t)((off >> 32) & 0xFF);
+    if (std::error_code ec = im.file.write(&low, 4)) return ec;
+    if (std::error_code ec = im.file.write(&high, 1)) return ec;
+  }
+
+  // Procmon's loader requires process-table indexes to be STRICTLY ascending;
+  // first-seen order is rejected as corrupt.
+  std::sort(im.processes.begin(), im.processes.end(),
+            [](const ProcRec& a, const ProcRec& b) { return a.idx < b.idx; });
+  const uint64_t processTableOffset = im.file.tell();
+  {
+    std::vector<uint8_t> t;
+    uint32_t count = (uint32_t)im.processes.size();
+    putU32(t, count);
+    for (const auto& p : im.processes) putU32(t, p.idx);
+    // Struct offsets are relative to the process-table start.
+    const uint64_t relStructsStart = 4 + 4ull * count + 4ull * count;
+    for (uint32_t i = 0; i < count; ++i)
+      putU32(t, (uint32_t)(relStructsStart + (uint64_t)i * kProcStructSize));
+    for (const auto& p : im.processes) {
+      putU32(t, p.idx);
+      putU32(t, p.pid);
+      putU32(t, p.ppid);
+      putU32(t, 0);              // parent_process_index
+      putU64(t, 0);              // authentication_id
+      putU32(t, 0);              // session
+      putU32(t, 0);              // unknown
+      putU64(t, 0);              // start_time
+      putU64(t, 0);              // end_time
+      putU32(t, 0);              // virtualized
+      putU32(t, 1);              // is_process_64bit
+      putU32(t, p.integrity);
+      putU32(t, p.user);
+      putU32(t, p.processName);
+      putU32(t, p.imagePath);
+      putU32(t, p.cmdline);
+      putU32(t, p.company);
+      putU32(t, p.version);
+      putU32(t, p.description);
+      putU32(t, 0);              // icon_index_small
+      putU32(t, 0);              // icon_index_big
+      // +0x60 (pvoid-sized): Procmon's loader requires the BYTE at struct+96
+      //  to be 1, else the file is rejected as corrupt.
+      putU8(t, 1);
+      putZeros(t, 7);
+      putU32(t, 0);              // number_of_modules (64-byte entries follow)
+    }
+    if (std::error_code ec = im.file.write(t.data(), t.size())) return ec;
+  }
+
+  const uint64_t stringsTableOffset = im.file.tell();
+  {
+    std::vector<uint8_t> t;
+    uint32_t count = (uint32_t)im.strings.size();
+    putU32(t, count);
+    uint64_t rel = 4 + 4ull * count;  // first entry starts here, relative to table
+    // Procmon's loader requires each non-empty string's byte size to INCLUDE
+    // a terminating NUL and the last wchar to be 0; a size that excludes it
+    // makes the whole file "corrupt". Emit every string as {u32 bytes incl.
+    // NUL; UTF-16 data; L'\0'}.
+    for (const auto& s : im.strings) {
+      putU32(t, (uint32_t)rel);
+      rel += 4 + 2ull * (s.size() + 1);
+    }
+    for (const auto& s : im.strings) {
+      putU32(t, (uint32_t)(2 * (s.size() + 1)));
+      putW(t, s);
+      putU16(t, 0);
+    }
+    if (std::error_code ec = im.file.write(t.data(), t.size())) return ec;
+  }
+
+  // Icon table (empty).
+  const uint64_t iconTableOffset = im.file.tell();
+  {
+    uint32_t z = 0;
+    if (std::error_code ec = im.file.write(&z, 4)) return ec;
+  }
+
+  // Hosts/ports table (empty): a hostnames sub-table then a ports sub-table,
+  // each just a zero count.
+  const uint64_t hostsPortsOffset = im.file.tell();
+  {
+    uint32_t z = 0;
+    if (std::error_code ec = im.file.write(&z, 4)) return ec;  // number_of_hostnames
+    if (std::error_code ec = im.file.write(&z, 4)) return ec;  // number_of_ports
+  }
+
+  // Patch the 936-byte header, written zeroed by open().
+  auto patchW = [&](uint64_t off, const void* data, size_t n) {
+    return im.file.patch(off, data, n);
+  };
+  auto patchU32F = [&](uint64_t off, uint32_t v) { return im.file.patch(off, &v, 4); };
+  auto patchU64F = [&](uint64_t off, uint64_t v) { return im.file.patch(off, &v, 8); };
+  auto patchWFixedF = [&](uint64_t off, const std::wstring& s, size_t fieldWchars) {
+    std::wstring t = s;
+    if (t.size() > fieldWchars - 1) t.resize(fieldWchars - 1);
+    return im.file.patch(off, t.data(), t.size() * 2);
+  };
+
+  if (auto ec = patchW(0x00, "PML_", 4)) return ec;
+  if (auto ec = patchU32F(0x04, 9)) return ec;   // format version
+  if (auto ec = patchU32F(0x08, 1)) return ec;   // is 64-bit
+
+  const wchar_t* computerName = _wgetenv(L"COMPUTERNAME");
+  if (auto ec = patchWFixedF(0x0C, computerName ? computerName : L"PMX", 16)) return ec;
+  if (auto ec = patchWFixedF(0x2C, L"C:\\Windows", 260)) return ec;
+
+  if (auto ec = patchU32F(0x234, (uint32_t)im.eventOffsets.size())) return ec;
+  if (auto ec = patchU64F(0x238, 0)) return ec;
+  if (auto ec = patchU64F(0x240, 0x3A8)) return ec;  // events array: right after the header
+  if (auto ec = patchU64F(0x248, eventsOffsetArrayOffset)) return ec;
+  if (auto ec = patchU64F(0x250, processTableOffset)) return ec;
+  if (auto ec = patchU64F(0x258, stringsTableOffset)) return ec;
+  if (auto ec = patchU64F(0x260, iconTableOffset)) return ec;
+  if (auto ec = patchU64F(0x268, 0x7FFFFFFEFFFFull)) return ec;  // max user address
+
+  // OSVERSIONINFOEXW block: zero except size/major/minor/build.
+  if (auto ec = patchU32F(0x270, 0x11C)) return ec;
+  if (auto ec = patchU32F(0x274, 10)) return ec;
+  if (auto ec = patchU32F(0x278, 0)) return ec;
+  if (auto ec = patchU32F(0x27C, 26100)) return ec;
+
+  if (auto ec = patchU32F(0x38C, 1)) return ec;         // logical processors
+  if (auto ec = patchU64F(0x390, 0)) return ec;         // ram
+  if (auto ec = patchU64F(0x398, 0x3A8)) return ec;     // header size
+  if (auto ec = patchU64F(0x3A0, hostsPortsOffset)) return ec;
+
+  return im.file.close();
+}
+
+uint64_t PmlWriter::count() const { return impl_->eventOffsets.size(); }
+
 std::error_code savePml(const wchar_t* path, const std::vector<Event>& all) {
   std::vector<const Event*> events;
   events.reserve(all.size());
@@ -362,229 +617,15 @@ std::error_code savePml(const wchar_t* path, const std::vector<Event>& all) {
                      return a->sequence < b->sequence;
                    });
 
-  // --- Step A: string interning (process fields only). ---
-  std::vector<std::wstring> strings;
-  std::unordered_map<std::wstring, uint32_t> index;
-  auto intern = [&](const std::wstring& s) -> uint32_t {
-    auto it = index.find(s);
-    if (it != index.end()) return it->second;
-    uint32_t id = (uint32_t)strings.size();
-    strings.push_back(s);
-    index.emplace(s, id);
-    return id;
-  };
-  intern(L"");  // index 0 = empty string
-
-  // --- Step B: collect distinct processes, first-seen order. A record first
-  // built from an unresolved event ("idx#N", pid 0) is replaced by the first
-  // resolved event for the same index. ---
-  std::vector<ProcRec> processes;
-  std::unordered_map<uint32_t, size_t> seenProcIdx;  // processIndex -> slot
-  std::vector<bool> slotResolved;
-  for (const Event* pev : events) {
-    const Event& ev = *pev;
-    auto seen = seenProcIdx.find(ev.processIndex);
-    const bool resolved = procResolved(ev);
-    if (seen != seenProcIdx.end() &&
-        (slotResolved[seen->second] || !resolved))
-      continue;
-    ProcRec pr;
-    pr.idx = ev.processIndex;
-    pr.pid = ev.pid;
-    pr.ppid = ev.parentPid;
-    pr.integrity = intern(ev.integrity);
-    pr.user = intern(ev.user);
-    pr.processName = intern(ev.processName);
-    pr.imagePath = intern(ev.imagePath);
-    pr.cmdline = intern(ev.commandLine);
-    pr.company = intern(L"");
-    pr.version = intern(L"");
-    pr.description = intern(L"");
-    if (seen != seenProcIdx.end()) {
-      processes[seen->second] = pr;
-      slotResolved[seen->second] = true;
-      continue;
-    }
-    seenProcIdx.emplace(ev.processIndex, processes.size());
-    processes.push_back(pr);
-    slotResolved.push_back(resolved);
-  }
-
-  // Procmon's loader requires process-table indexes to be STRICTLY ascending
-  // ; first-seen order is rejected as corrupt.
-  std::sort(processes.begin(), processes.end(),
-            [](const ProcRec& a, const ProcRec& b) { return a.idx < b.idx; });
-
-  // --- Step C: lay out sections. ---
-  // Section order matches real Procmon files: readers (procmon-parser) infer
-  // each section's size from the *next* section's offset, so events -> events
-  // offset array -> process table -> strings -> icons -> hosts must be adjacent
-  // and in this order.
-  std::vector<uint8_t> buf;
-  buf.resize(0x3A8, 0);  // header, patched at the end
-
-  // 1. Events array (fixed 0x34-byte records, no stacks, no detail).
-  const uint64_t eventsArrayOffset = buf.size();
-  std::vector<uint32_t> eventOffsets;
-  eventOffsets.reserve(events.size());
-  for (const Event* pev : events) {
-    const Event& ev = *pev;
-    if (buf.size() > UINT32_MAX) return errc(ERROR_FILE_TOO_LARGE);  // u32 offsets
-    eventOffsets.push_back((uint32_t)buf.size());
-    // Build the operation-specific detail blob.
-    std::vector<uint8_t> detail;
-    if (ev.eventClass == 2) appendRegDetail(detail, ev);
-    else if (ev.eventClass == 3 || ev.eventClass == 6) appendFsDetail(detail, ev);
-    else if (ev.eventClass == 1) {
-      if (ev.operation == 0 || ev.operation == 1) {
-        // The process the record DESCRIBES (for Process Create: the child, not
-        // the creator). Pre-v6 logs lack target*: fall back to the event's own
-        // process, which is right for op 0.
-        const bool haveTarget = ev.targetPid != 0 || !ev.targetCmdline.empty();
-        appendProcessDetail(detail, ev.operation,
-                            haveTarget ? ev.path : ev.imagePath,
-                            haveTarget ? ev.targetCmdline : ev.commandLine,
-                            haveTarget ? ev.targetPid : ev.pid);
-      } else {
-        appendProcessDetail(detail, ev.operation, ev.path.empty() ? ev.imagePath : ev.path,
-                            ev.commandLine, ev.pid);
-      }
-    }
-    else if (ev.eventClass == 5) appendNetworkDetail(detail, ev);
-    else if (ev.eventClass == 4) appendProfilingDetail(detail, ev.operation);
-    std::vector<uint8_t> extra = buildExtraDetails(ev);
-    // The reader finds the extra blob at extra_detail_offset counted from the
-    // event start; with no stack frames it sits right after the details as
-    // [u16 size][bytes], so the offset is 0x34 + detail size.
-    const uint32_t extraOff =
-        extra.empty() ? 0u : (uint32_t)(0x34 + detail.size());
-    putU32(buf, ev.processIndex);
-    putU32(buf, ev.tid);            // thread_id
-    putU32(buf, ev.eventClass);
-    putU16(buf, ev.operation);
-    putZeros(buf, 6);
-    putU64(buf, ev.duration);
-    putU64(buf, ev.timestamp);
-    putU32(buf, ev.result);
-    putU16(buf, 0);                 // stack_depth
-    putU16(buf, 0);                 // zero
-    putU32(buf, (uint32_t)detail.size());  // detail_size
-    putU32(buf, extraOff);          // extra_detail_offset
-    buf.insert(buf.end(), detail.begin(), detail.end());
-    if (!extra.empty()) {
-      putU16(buf, (uint16_t)extra.size());
-      buf.insert(buf.end(), extra.begin(), extra.end());
+  PmlWriter w;
+  if (std::error_code ec = w.open(path)) return ec;
+  for (const Event* ev : events) {
+    if (std::error_code ec = w.write(*ev)) {
+      w.close();
+      return ec;
     }
   }
-
-  // 2. Events offset array ({u32 file offset, u8 flags} per event).
-  const uint64_t eventsOffsetArrayOffset = buf.size();
-  for (uint32_t off : eventOffsets) {
-    putU32(buf, off);
-    putU8(buf, 0);  // flags
-  }
-
-  // 3. Process table.
-  const uint64_t processTableOffset = buf.size();
-  {
-    uint32_t count = (uint32_t)processes.size();
-    putU32(buf, count);
-    for (const auto& p : processes) putU32(buf, p.idx);
-    // Struct offsets are relative to the process-table start.
-    const uint64_t relStructsStart = 4 + 4ull * count + 4ull * count;
-    for (uint32_t i = 0; i < count; ++i)
-      putU32(buf, (uint32_t)(relStructsStart + (uint64_t)i * kProcStructSize));
-    for (const auto& p : processes) {
-      putU32(buf, p.idx);
-      putU32(buf, p.pid);
-      putU32(buf, p.ppid);
-      putU32(buf, 0);              // parent_process_index
-      putU64(buf, 0);              // authentication_id
-      putU32(buf, 0);              // session
-      putU32(buf, 0);              // unknown
-      putU64(buf, 0);              // start_time
-      putU64(buf, 0);              // end_time
-      putU32(buf, 0);              // virtualized
-      putU32(buf, 1);              // is_process_64bit
-      putU32(buf, p.integrity);
-      putU32(buf, p.user);
-      putU32(buf, p.processName);
-      putU32(buf, p.imagePath);
-      putU32(buf, p.cmdline);
-      putU32(buf, p.company);
-      putU32(buf, p.version);
-      putU32(buf, p.description);
-      putU32(buf, 0);              // icon_index_small
-      putU32(buf, 0);              // icon_index_big
-      // +0x60 (pvoid-sized): Procmon's loader requires the BYTE at struct+96
-      //  to be 1, else the file is rejected as corrupt.
-      putU8(buf, 1);
-      putZeros(buf, 7);
-      putU32(buf, 0);              // number_of_modules (64-byte entries follow)
-    }
-  }
-
-  // 4. Strings table.
-  const uint64_t stringsTableOffset = buf.size();
-  {
-    uint32_t count = (uint32_t)strings.size();
-    putU32(buf, count);
-    uint64_t rel = 4 + 4ull * count;  // first entry starts here, relative to table
-    //  Procmon's loader requires each non-empty string's byte
-    // size to INCLUDE a terminating NUL and the last wchar to be 0; a size that
-    // excludes it makes the whole file "corrupt". Emit every string as
-    // {u32 bytes incl. NUL; UTF-16 data; L'\0'}.
-    for (const auto& s : strings) {
-      putU32(buf, (uint32_t)rel);
-      rel += 4 + 2ull * (s.size() + 1);
-    }
-    for (const auto& s : strings) {
-      putU32(buf, (uint32_t)(2 * (s.size() + 1)));
-      putW(buf, s);
-      putU16(buf, 0);
-    }
-  }
-
-  // 5. Icon table (empty).
-  const uint64_t iconTableOffset = buf.size();
-  putU32(buf, 0);
-
-  // 6. Hosts/ports table (empty): a hostnames sub-table then a ports sub-table,
-  // each just a zero count.
-  const uint64_t hostsPortsOffset = buf.size();
-  putU32(buf, 0);  // number_of_hostnames
-  putU32(buf, 0);  // number_of_ports
-
-  // --- Step D: patch the 936-byte header. ---
-  patchBytes(buf, 0x00, "PML_", 4);
-  patchU32(buf, 0x04, 9);   // format version
-  patchU32(buf, 0x08, 1);   // is 64-bit
-
-  const wchar_t* computerName = _wgetenv(L"COMPUTERNAME");
-  patchWFixed(buf, 0x0C, computerName ? computerName : L"PMX", 16);
-  patchWFixed(buf, 0x2C, L"C:\\Windows", 260);
-
-  patchU32(buf, 0x234, (uint32_t)events.size());
-  patchU64(buf, 0x238, 0);
-  patchU64(buf, 0x240, eventsArrayOffset);
-  patchU64(buf, 0x248, eventsOffsetArrayOffset);
-  patchU64(buf, 0x250, processTableOffset);
-  patchU64(buf, 0x258, stringsTableOffset);
-  patchU64(buf, 0x260, iconTableOffset);
-  patchU64(buf, 0x268, 0x7FFFFFFEFFFFull);  // max user address
-
-  // OSVERSIONINFOEXW block: zero except size/major/minor/build.
-  patchU32(buf, 0x270, 0x11C);
-  patchU32(buf, 0x274, 10);
-  patchU32(buf, 0x278, 0);
-  patchU32(buf, 0x27C, 26100);
-
-  patchU32(buf, 0x38C, 1);   // logical processors
-  patchU64(buf, 0x390, 0);   // ram
-  patchU64(buf, 0x398, 0x3A8);  // header size
-  patchU64(buf, 0x3A0, hostsPortsOffset);
-
-  return writeWholeFile(path, buf.data(), buf.size());
+  return w.close();
 }
 
 }  // namespace pmx
