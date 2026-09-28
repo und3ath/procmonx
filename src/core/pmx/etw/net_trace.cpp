@@ -168,7 +168,10 @@ std::error_code NetTrace::run(const Sink& sink, uint64_t maxCount) {
     tp->Wnode.BufferSize = static_cast<ULONG>(propsSize);
     tp->Wnode.Guid = SystemTraceControlGuid;
     tp->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-    ControlTraceW(0, KERNEL_LOGGER_NAMEW, tp, EVENT_TRACE_CONTROL_STOP);
+    if (ControlTraceW(0, KERNEL_LOGGER_NAMEW, tp, EVENT_TRACE_CONTROL_STOP) ==
+            ERROR_SUCCESS &&
+        onTookOverSession)
+      onTookOverSession();
   }
 
   // Stop already requested before we started: don't spin up a session at all.
@@ -202,13 +205,21 @@ std::error_code NetTrace::run(const Sink& sink, uint64_t maxCount) {
     return {static_cast<int>(err), std::system_category()};
   }
 
-  std::thread worker([traceHandle]() mutable {
+  std::atomic<bool> consumerEnded{false};
+  std::thread worker([traceHandle, &consumerEnded]() mutable {
     ProcessTrace(&traceHandle, 1, nullptr, nullptr);
+    consumerEnded = true;
   });
 
+  bool lostSession = false;
   for (;;) {
     if (stopRequested_.load(std::memory_order_relaxed)) break;
     if (maxCount != 0 && count.load(std::memory_order_relaxed) >= maxCount) break;
+    // ProcessTrace only returns early when the session was stopped under us.
+    if (consumerEnded.load()) {
+      lostSession = true;
+      break;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   // Suppress further emits, stop the session (no new events), then close the
@@ -218,6 +229,7 @@ std::error_code NetTrace::run(const Sink& sink, uint64_t maxCount) {
   CloseTrace(traceHandle);
   if (worker.joinable()) worker.join();
 
+  if (lostSession) return {ERROR_OPERATION_ABORTED, std::system_category()};
   return {};
 }
 

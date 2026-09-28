@@ -213,6 +213,11 @@ re-filtering. Validate a generated `.pml` with
   ```
   `buffer_mb` minimum 16; empty `spool_dir` = `%TEMP%`. Pick a spool dir with free
   space about the size of the capture.
+- **Network capture** uses the system-wide *NT Kernel Logger* ETW session, which
+  only one consumer can own. `pmx` stops an existing one to start its own (and
+  says so), so don't run it alongside other tools that use that session
+  (xperf/WPR, another `pmx --net`); if another tool stops it mid-capture, `pmx`
+  reports it and keeps what it captured.
 - **Kernel-side selection.** `--capture` / `--class` choose which classes the
   driver *generates*; all rule filtering happens in user mode. Registry can be
   turned off entirely at the driver; process capture is always on because it

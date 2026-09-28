@@ -940,14 +940,22 @@ int cmdLive(int argc, wchar_t** argv) {
   std::thread netThread;
   if (withNet) {
     g_netTrace = &netTrace;
+    netTrace.onTookOverSession = [&] {
+      std::lock_guard<std::mutex> lk(emitMx);
+      errf("live: stopped an existing NT Kernel Logger session (another tool "
+           "or an earlier pmx) to capture network events\n");
+    };
     netThread = std::thread([&] {
       std::error_code nec = netTrace.run(
           [&](const pmx::NetEvent& nev) { pushEvent(netEventToEvent(nev), nullptr); },
           0);  // until stop()
       if (nec) {
         std::lock_guard<std::mutex> lk(emitMx);
-        errf("live: network capture disabled (%s)\n",
-                     nec.message().c_str());
+        if (nec.value() == ERROR_OPERATION_ABORTED)
+          errf("live: network capture stopped - the NT Kernel Logger session "
+               "was stopped by another tool\n");
+        else
+          errf("live: network capture disabled (%s)\n", nec.message().c_str());
       }
     });
   }
@@ -1095,6 +1103,10 @@ int cmdNet(int argc, wchar_t** argv) {
   }
   bool spoolErrorPrinted = false;
 
+  trace.onTookOverSession = [] {
+    errf("net: stopped an existing NT Kernel Logger session (another tool or "
+         "an earlier pmx)\n");
+  };
   long long n = 0;
   std::error_code ec = trace.run(
       [&](const pmx::NetEvent& nev) {
@@ -1119,7 +1131,10 @@ int cmdNet(int argc, wchar_t** argv) {
         ++n;
       },
       maxCount);
-  if (ec) {
+  if (ec.value() == ERROR_OPERATION_ABORTED) {
+    errf("net: capture ended early - the NT Kernel Logger session was stopped "
+         "by another tool\n");
+  } else if (ec) {
     printError("net", ec);
     if (ec == std::error_code(ERROR_ACCESS_DENIED, std::system_category()))
       errf("(needs admin -> run: pmx elevate net)\n");

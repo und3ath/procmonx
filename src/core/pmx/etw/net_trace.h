@@ -33,8 +33,13 @@ class NetTrace {
   // Runs until `maxCount` events delivered (0 = until stop()) or an error. The
   // sink is called from the processing thread for each decoded event. A stop()
   // issued before run() is honoured (the flag is sticky; one run per object).
+  // The NT Kernel Logger is a single system-wide session: if another consumer
+  // stops it, run() returns ERROR_OPERATION_ABORTED instead of waiting forever.
   std::error_code run(const Sink& sink, uint64_t maxCount);
   void stop() noexcept;  // request the run() to end (thread-safe)
+  // Called from run() when an existing NT Kernel Logger session (another tool,
+  // or a crashed pmx) had to be stopped to start ours.
+  std::function<void()> onTookOverSession;
  private:
   std::atomic<bool> stopRequested_{false};
 };
