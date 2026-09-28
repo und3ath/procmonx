@@ -9,6 +9,14 @@
 // (CreateFile OpenResult, RegCreateKey disposition, RegQueryValue result) is
 // mapped back onto the CompletedEvent. The file is untrusted: every read is
 // bounds-checked.
+//
+// PmlReader parses the header/strings/process-table/hosts-ports once in
+// open() (kept as Impl members - the process table and host/port maps are
+// needed by every event) and decodes one event per next() call over a
+// memory-mapped view of the file, so loadPml's callers don't need the whole
+// file or the whole decoded event list resident at once.
+
+#include "pmx/pml.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -24,7 +32,6 @@
 #include "pmx/driver/protocol.h"
 #include "pmx/enrich/process_table.h"
 #include "pmx/file_io.h"
-#include "pmx/pml.h"
 
 namespace pmx {
 
@@ -34,8 +41,8 @@ std::error_code errc(int e) { return {e, std::system_category()}; }
 
 // Bounds-checked little-endian view over the file bytes.
 struct View {
-  const uint8_t* p;
-  size_t n;
+  const uint8_t* p = nullptr;
+  size_t n = 0;
   bool has(uint64_t off, uint64_t len) const {
     return off <= n && len <= n - off;
   }
@@ -81,10 +88,29 @@ const char* netOpName(uint16_t op) {
 
 }  // namespace
 
-std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
-  std::string buf;
-  if (std::error_code ec = readWholeFile(path, buf)) return ec;
-  const View v{reinterpret_cast<const uint8_t*>(buf.data()), buf.size()};
+struct PmlReader::Impl {
+  MappedFile file;
+  View v;
+  uint32_t count = 0;
+  uint64_t evOff = 0, eoOff = 0;
+  ProcessTable procs;
+  std::map<std::string, std::wstring> hosts;            // 16-byte ip -> name
+  std::map<std::pair<uint16_t, bool>, std::wstring> ports;
+  uint32_t idx = 0;
+  std::error_code err;
+};
+
+PmlReader::PmlReader() : impl_(std::make_unique<Impl>()) {}
+PmlReader::~PmlReader() = default;
+
+std::error_code PmlReader::error() const { return impl_->err; }
+uint32_t PmlReader::declaredCount() const { return impl_->count; }
+
+std::error_code PmlReader::open(const wchar_t* path) {
+  Impl& im = *impl_;
+  if (std::error_code ec = im.file.open(path)) return ec;
+  im.v = View{im.file.data(), im.file.size()};
+  const View& v = im.v;
   const auto bad = [] { return errc(ERROR_INVALID_DATA); };
 
   // --- Header ---------------------------------------------------------------
@@ -103,7 +129,8 @@ std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
     return bad();
   if (!v.has(eoOff, 5ull * count)) return bad();
 
-  // --- Strings ----------------------------------------------------------------
+  // --- Strings ------------------------------------------------------------
+  // Only needed to resolve the process table below; not kept afterwards.
   std::vector<std::wstring> strings;
   {
     const uint64_t size = icOff - stOff;
@@ -123,8 +150,7 @@ std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
     return i < strings.size() ? strings[i] : std::wstring();
   };
 
-  // --- Process table -> ProcessTable -------------------------------------------
-  ProcessTable procs;
+  // --- Process table -> ProcessTable ---------------------------------------
   {
     const uint64_t size = stOff - ptOff;
     if (!v.has(ptOff, 4)) return bad();
@@ -146,13 +172,11 @@ std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
       pi.image = str(v.u32(b + 0x44));
       pi.cmdline = str(v.u32(b + 0x48));
       if (pi.name.empty()) pi.name = basename(pi.image);
-      procs.define(v.u32(b), std::move(pi));
+      im.procs.define(v.u32(b), std::move(pi));
     }
   }
 
-  // --- Hosts / ports (resolved names Procmon shows in network paths) ------------
-  std::map<std::string, std::wstring> hosts;           // 16-byte ip -> name
-  std::map<std::pair<uint16_t, bool>, std::wstring> ports;
+  // --- Hosts / ports (resolved names Procmon shows in network paths) -------
   if (hpOff && v.has(hpOff, 4)) {
     uint64_t p = hpOff;
     const uint32_t nh = v.u32(p);
@@ -164,7 +188,7 @@ std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
       const uint32_t len = v.u32(p + 16);
       p += 20;
       if (!v.has(p, len)) { ok = false; break; }
-      hosts[key] = wstr(v, p, len);
+      im.hosts[key] = wstr(v, p, len);
       p += len;
     }
     if (ok && v.has(p, 4)) {
@@ -177,18 +201,30 @@ std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
         const uint32_t len = v.u32(p + 4);
         p += 8;
         if (!v.has(p, len)) break;
-        ports[{port, tcp}] = wstr(v, p, len);
+        im.ports[{port, tcp}] = wstr(v, p, len);
         p += len;
       }
     }
   }
 
-  // --- Events -------------------------------------------------------------------
-  out.reserve(out.size() + count);
-  for (uint32_t i = 0; i < count; ++i) {
-    const uint64_t e = eoOff + 5ull * i;
-    const uint64_t off = v.u32(e) | (static_cast<uint64_t>(v.p[e + 4]) << 32);
-    if (off < evOff || !v.has(off, 0x34) || off + 0x34 > eoOff) return bad();
+  im.count = count;
+  im.evOff = evOff;
+  im.eoOff = eoOff;
+  im.idx = 0;
+  return {};
+}
+
+bool PmlReader::next(Event& e) {
+  Impl& im = *impl_;
+  if (im.err) return false;
+  const View& v = im.v;
+  const auto bad = [&] { im.err = errc(ERROR_INVALID_DATA); return false; };
+
+  while (im.idx < im.count) {
+    const uint32_t i = im.idx++;
+    const uint64_t eo = im.eoOff + 5ull * i;
+    const uint64_t off = v.u32(eo) | (static_cast<uint64_t>(v.p[eo + 4]) << 32);
+    if (off < im.evOff || !v.has(off, 0x34) || off + 0x34 > im.eoOff) return bad();
     const uint32_t cls = v.u32(off + 0x08);
     const uint16_t op = v.u16(off + 0x0C);
     const uint64_t duration = v.u64(off + 0x14);
@@ -261,7 +297,7 @@ std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
       }
     }
 
-    Event ev = decodeEvent(ce, procs);
+    Event ev = decodeEvent(ce, im.procs);
     ev.duration = duration;
 
     if (cls == 5) {
@@ -282,10 +318,10 @@ std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
         ev.netFlags = static_cast<uint8_t>(flags & 7);
         ev.ioLength = len;
         auto endpoint = [&](const uint8_t* ip, bool v4, uint16_t port) {
-          auto h = hosts.find(std::string(reinterpret_cast<const char*>(ip), 16));
-          std::wstring s = h != hosts.end() ? h->second : ipString(ip, v4);
-          auto pn = ports.find({port, tcp});
-          return s + L":" + (pn != ports.end() ? pn->second : std::to_wstring(port));
+          auto h = im.hosts.find(std::string(reinterpret_cast<const char*>(ip), 16));
+          std::wstring s = h != im.hosts.end() ? h->second : ipString(ip, v4);
+          auto pn = im.ports.find({port, tcp});
+          return s + L":" + (pn != im.ports.end() ? pn->second : std::to_wstring(port));
         };
         ev.path = endpoint(ev.netSrcIp, flags & 1, ev.netSrcPort) + L" -> " +
                   endpoint(ev.netDstIp, (flags & 2) != 0, ev.netDstPort);
@@ -293,9 +329,19 @@ std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
         ev.opName = std::string(tcp ? "TCP " : "UDP ") + netOpName(op);
       }
     }
-    out.push_back(std::move(ev));
+
+    e = std::move(ev);
+    return true;
   }
-  return {};
+  return false;  // all declared events consumed
+}
+
+std::error_code loadPml(const wchar_t* path, std::vector<Event>& out) {
+  PmlReader r;
+  if (std::error_code ec = r.open(path)) return ec;
+  Event e;
+  while (r.next(e)) out.push_back(std::move(e));
+  return r.error();
 }
 
 }  // namespace pmx

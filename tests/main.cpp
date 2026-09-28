@@ -13,6 +13,7 @@ int test_pid_names();
 int test_pml();
 int test_spool();
 int test_writers();
+int test_readers();
 
 int main() {
   int fails = 0;
@@ -27,6 +28,7 @@ int main() {
   fails += test_pml();
   fails += test_spool();
   fails += test_writers();
+  fails += test_readers();
   if (fails == 0) {
     std::printf("ALL TESTS PASSED\n");
     return 0;

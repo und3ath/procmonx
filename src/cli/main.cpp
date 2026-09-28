@@ -506,41 +506,50 @@ bool isFailure(uint32_t status) {
   return status >= 0xC0000000u && status != kFastIoDisallowed;
 }
 
-// Print a count table of `events` grouped by `by`, most frequent first.
-void printSummary(const std::vector<pmx::Event>& events, SummaryBy by,
-                  long long top) {
+// Grouped count table for `summary` / `open --summary`, aggregated as events stream.
+struct SummaryAgg {
   struct Agg { uint64_t count = 0, failed = 0; };
   std::unordered_map<std::wstring, Agg> m;
+  uint64_t total = 0;
   uint64_t failedTotal = 0;
-  for (const auto& ev : events) {
+  SummaryBy by;
+
+  explicit SummaryAgg(SummaryBy by) : by(by) {}
+
+  void add(const pmx::Event& ev) {
     Agg& a = m[summaryKey(ev, by)];
     ++a.count;
+    ++total;
     if (isFailure(ev.result)) {
       ++a.failed;
       ++failedTotal;
     }
   }
-  std::vector<std::pair<std::wstring, Agg>> rows(m.begin(), m.end());
-  std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
-    return a.second.count != b.second.count ? a.second.count > b.second.count
-                                            : a.first < b.first;
-  });
-  const double total = events.empty() ? 1.0 : (double)events.size();
-  outf("%10s %6s %8s  %s\n", "count", "%", "failed", "key");
-  long long shown = 0;
-  for (const auto& [key, a] : rows) {
-    if (top > 0 && shown++ >= top) break;
-    const std::string k = toUtf8(key.data(), static_cast<int>(key.size()));
-    outf("%10llu %5.1f%% %8llu  %s\n", (unsigned long long)a.count,
-         100.0 * a.count / total, (unsigned long long)a.failed, k.c_str());
+
+  void print(long long top) const {
+    std::vector<std::pair<std::wstring, Agg>> rows(m.begin(), m.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+      return a.second.count != b.second.count ? a.second.count > b.second.count
+                                              : a.first < b.first;
+    });
+    const double totalD = total ? (double)total : 1.0;
+    outf("%10s %6s %8s  %s\n", "count", "%", "failed", "key");
+    long long shown = 0;
+    for (const auto& [key, a] : rows) {
+      if (top > 0 && shown++ >= top) break;
+      const std::string k = toUtf8(key.data(), static_cast<int>(key.size()));
+      outf("%10llu %5.1f%% %8llu  %s\n", (unsigned long long)a.count,
+           100.0 * a.count / totalD, (unsigned long long)a.failed, k.c_str());
+    }
+    outf("%zu distinct, %llu events, %llu failed%s\n", rows.size(),
+         (unsigned long long)total, (unsigned long long)failedTotal,
+         top > 0 && (long long)rows.size() > top ? " (use --top 0 for all)" : "");
   }
-  outf("%zu distinct, %zu events, %llu failed%s\n", rows.size(), events.size(),
-       (unsigned long long)failedTotal,
-       top > 0 && (long long)rows.size() > top ? " (use --top 0 for all)" : "");
-}
+};
 
 // `open` and `summary` share loading + filtering. summary=true prints the
-// grouped table (--by/--top) instead of rows.
+// grouped table (--by/--top) instead of rows. The file is streamed; file
+// outputs go through the same RAM-bounded spool as `live`.
 int cmdOpenOrSummary(int argc, wchar_t** argv, bool summary) {
   if (argc < 1) {
     if (summary)
@@ -550,7 +559,8 @@ int cmdOpenOrSummary(int argc, wchar_t** argv, bool summary) {
       outf("open: pmx open FILE.(pmxlog|pml) [-f RULE] [-x RULE] "
            "[--filter-file cfg]... [--filter-dir DIR] [--match procmon|any] "
            "[--groups any|all] [--pid N] [--proc NAME] [--failed] [--class C] "
-           "[--count N] [--csv F] [--pml F] [--json F|-] [--quiet]\n");
+           "[--count N] [--csv F] [--pml F] [--json F|-] [--quiet] "
+           "[--config F] [--buffer-mb N] [--spool-dir DIR]\n");
     return 1;
   }
   const wchar_t* path = argv[0];
@@ -563,6 +573,9 @@ int cmdOpenOrSummary(int argc, wchar_t** argv, bool summary) {
   const wchar_t* jsonPath = nullptr;
   bool summaryMode = summary;  // the `summary` command, or open with --summary
   bool quiet = summary;
+  const wchar_t* configPath = nullptr;
+  long long bufferMbArg = -1;
+  const wchar_t* spoolDirArg = nullptr;
   FilterCli fc;
   for (int i = 1; i < argc; ++i) {
     if (parseFilterArg(argc, argv, i, fc)) continue;
@@ -582,6 +595,12 @@ int cmdOpenOrSummary(int argc, wchar_t** argv, bool summary) {
       summaryMode = quiet = true;
     else if (!wcscmp(argv[i], L"--top") && i + 1 < argc)
       top = wcstoll(argv[++i], nullptr, 0);
+    else if (!wcscmp(argv[i], L"--config") && i + 1 < argc)
+      configPath = argv[++i];
+    else if (!wcscmp(argv[i], L"--buffer-mb") && i + 1 < argc)
+      bufferMbArg = wcstoll(argv[++i], nullptr, 0);
+    else if (!wcscmp(argv[i], L"--spool-dir") && i + 1 < argc)
+      spoolDirArg = argv[++i];
     else if (!wcscmp(argv[i], L"--by") && i + 1 < argc) {
       auto b = parseSummaryBy(argv[++i]);
       if (!b) {
@@ -596,55 +615,85 @@ int cmdOpenOrSummary(int argc, wchar_t** argv, bool summary) {
   if (jsonStdout) quiet = true;
   g_jsonStdout = jsonStdout;
 
+  PmxConfig pmxConfig;
+  if (int rc = loadPmxConfig(configPath, pmxConfig)) return rc;
+  if (bufferMbArg >= 0) pmxConfig.bufferMb = bufferMbArg < 16 ? 16 : (size_t)bufferMbArg;
+  if (spoolDirArg) pmxConfig.spoolDir = spoolDirArg;
+
   pmx::FilterSet filters;       // -f/-x rules
   pmx::FilterGroup dirFilters;  // one lens per --filter-file / --filter-dir file
   if (int rc = buildFilters(fc, filters, dirFilters)) return rc;
 
   // .pml (Procmon's own log, or one pmx wrote) or pmx's native .pmxlog.
-  std::vector<pmx::Event> events;
   const wchar_t* dot = wcsrchr(path, L'.');
   const bool isPml = dot && !_wcsicmp(dot, L".pml");
-  std::error_code ec =
-      isPml ? pmx::loadPml(path, events) : pmx::loadEvents(path, events);
+  pmx::PmlReader pmlReader;
+  pmx::PmxlogReader pmxReader;
+  std::error_code ec = isPml ? pmlReader.open(path) : pmxReader.open(path);
   if (ec) {
     printError("open", ec);
     if (isPml && ec.value() == ERROR_NOT_SUPPORTED)
       errf("(only 64-bit Process Monitor logs, format v4-v9, are supported)\n");
     return 3;
   }
+  const auto nextEvent = [&](pmx::Event& e) {
+    return isPml ? pmlReader.next(e) : pmxReader.next(e);
+  };
+  const uint32_t declaredCount =
+      isPml ? pmlReader.declaredCount() : pmxReader.declaredCount();
 
   SetConsoleOutputCP(CP_UTF8);
-  std::vector<pmx::Event> shown;
-  const bool keep = csvPath || pmlPath || (jsonPath && !jsonStdout) || summaryMode;
+  SummaryAgg agg(by);
+  std::optional<pmx::EventSpool> spool;
+  const bool jsonFile = jsonPath && !jsonStdout;
+  if (!summaryMode && (csvPath || pmlPath || jsonFile)) {
+    pmx::SpoolOptions sopt;
+    sopt.bufferBytes = pmxConfig.bufferMb << 20;
+    sopt.dir = pmxConfig.spoolDir;
+    spool.emplace(sopt);
+    spool->onSpill = [](size_t idx, uint64_t cnt) {
+      statusf("[pmx] buffer full: spilled run %zu (%llu events) to disk\n",
+             idx, (unsigned long long)cnt);
+    };
+  }
+
   long long n = 0;
-  for (const auto& ev : events) {
+  uint64_t read = 0;
+  pmx::Event ev;
+  while (nextEvent(ev)) {
+    ++read;
     if (classFilter >= 0 && ev.eventClass != classFilter) continue;
     if (!filters.matches(ev)) continue;
     if (!dirFilters.matches(ev)) continue;
     if (!quiet) printRow(n, ev);
     if (jsonStdout) writeJsonRow(ev);
-    if (keep) shown.push_back(ev);
+    if (summaryMode) agg.add(ev);
+    if (spool) {
+      if (std::error_code se = spool->add(ev, 1)) {
+        printError("spool", se);
+        return 4;
+      }
+    }
     if (++n == maxCount) break;
   }
+  const std::error_code readErr = isPml ? pmlReader.error() : pmxReader.error();
+  if (readErr) {
+    printError("open", readErr);
+    return 3;
+  }
   if (summaryMode) {
-    printSummary(shown, by, top);
+    agg.print(top);
     return 0;
   }
-  statusf("Shown %lld of %zu events.\n", n, events.size());
-  if (jsonPath && !jsonStdout) {
-    std::error_code je = pmx::saveEventsJson(jsonPath, shown);
-    if (je) { printError("json", je); return 4; }
-    statusf("Wrote %zu events to %ls\n", shown.size(), jsonPath);
-  }
-  if (csvPath) {
-    std::error_code ce = pmx::saveEventsCsv(csvPath, shown);
-    if (ce) { printError("csv", ce); return 4; }
-    statusf("Wrote %zu events to %ls\n", shown.size(), csvPath);
-  }
-  if (pmlPath) {
-    std::error_code pe = pmx::savePml(pmlPath, shown);
-    if (pe) { printError("pml", pe); return 4; }
-    statusf("Wrote %zu events to %ls\n", shown.size(), pmlPath);
+  // A .pmxlog whose writer died keeps count 0 in its header but is still read.
+  statusf("Shown %lld of %llu events.\n", n,
+          (unsigned long long)std::max<uint64_t>(read, declaredCount));
+  if (spool) {
+    LiveOutputPaths paths;
+    paths.csv = csvPath;
+    paths.json = jsonFile ? jsonPath : nullptr;
+    paths.pml = pmlPath;
+    if (int rc = finalizeSpool(*spool, paths, /*unfiltered=*/false)) return rc;
   }
   return 0;
 }

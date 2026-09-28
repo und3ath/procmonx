@@ -71,6 +71,64 @@ inline std::error_code readWholeFile(const wchar_t* path, std::string& out) {
   return ec;
 }
 
+// Read-only memory map of a whole file, for a reader that wants to stream
+// through a large file without a read() copy into a std::string first (the
+// OS pages it in on demand instead of the process committing it up front).
+// Mapping a 0-byte file fails on Windows, so that case is handled specially:
+// size() is 0 and data() stays null, and open() still succeeds.
+class MappedFile {
+ public:
+  MappedFile() = default;
+  MappedFile(const MappedFile&) = delete;
+  MappedFile& operator=(const MappedFile&) = delete;
+  ~MappedFile() { close(); }
+
+  std::error_code open(const wchar_t* path) {
+    close();
+    h_ = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h_ == INVALID_HANDLE_VALUE)
+      return {static_cast<int>(GetLastError()), std::system_category()};
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h_, &sz)) {
+      std::error_code ec{static_cast<int>(GetLastError()), std::system_category()};
+      close();
+      return ec;
+    }
+    size_ = static_cast<size_t>(sz.QuadPart);
+    if (size_ == 0) return {};  // nothing to map; data()/size() report empty
+    map_ = CreateFileMappingW(h_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!map_) {
+      std::error_code ec{static_cast<int>(GetLastError()), std::system_category()};
+      close();
+      return ec;
+    }
+    data_ = static_cast<const uint8_t*>(MapViewOfFile(map_, FILE_MAP_READ, 0, 0, 0));
+    if (!data_) {
+      std::error_code ec{static_cast<int>(GetLastError()), std::system_category()};
+      close();
+      return ec;
+    }
+    return {};
+  }
+
+  const uint8_t* data() const { return data_; }
+  size_t size() const { return size_; }
+
+  void close() {
+    if (data_) { UnmapViewOfFile(data_); data_ = nullptr; }
+    if (map_) { CloseHandle(map_); map_ = nullptr; }
+    if (h_ != INVALID_HANDLE_VALUE) { CloseHandle(h_); h_ = INVALID_HANDLE_VALUE; }
+    size_ = 0;
+  }
+
+ private:
+  HANDLE h_ = INVALID_HANDLE_VALUE;
+  HANDLE map_ = nullptr;
+  const uint8_t* data_ = nullptr;
+  size_t size_ = 0;
+};
+
 // Buffered sequential writer: batches writes into a 1 MB buffer so a caller
 // streaming many small records (a PMX record, a CSV row, a PML event) doesn't
 // pay a WriteFile syscall per record. `patch` lets a writer that only learns a

@@ -144,6 +144,7 @@ void appendEventRecord(std::string& b, const Event& e) {
 }
 
 bool readEventRecord(const char*& p, const char* end, uint32_t version, Event& e) {
+  e = Event{};  // older versions leave later fields unset; callers reuse `e`
   Reader r{p, end};
   e.sequence = r.u32();
   e.timestamp = r.u64();
@@ -424,29 +425,49 @@ std::error_code saveEventsJson(const wchar_t* path,
   return w.close();
 }
 
-std::error_code loadEvents(const wchar_t* path, std::vector<Event>& out) {
-  std::string buf;
-  if (std::error_code ec = readWholeFile(path, buf)) return ec;
-
-  Reader r{buf.data(), buf.data() + buf.size()};
+std::error_code PmxlogReader::open(const wchar_t* path) {
+  if (std::error_code ec = file_.open(path)) return ec;
+  const char* p = reinterpret_cast<const char*>(file_.data());
+  const char* end = p + file_.size();
+  Reader r{p, end};
   if (r.u32() != kMagic) return errc(ERROR_INVALID_DATA);
-  uint32_t version = r.u32();
-  if (version < 1 || version > kVersion) return errc(ERROR_INVALID_DATA);
-  uint32_t count = r.u32();
+  version_ = r.u32();
+  if (!r.ok || version_ < 1 || version_ > kVersion) return errc(ERROR_INVALID_DATA);
+  declaredCount_ = r.u32();
   r.u32();  // reserved
-  // `count` comes from the file: bound the reservation by what the bytes could
-  // possibly hold (every record is well over 64 bytes) so a corrupt header
-  // can't trigger a multi-GB allocation.
-  const size_t maxByBytes = buf.size() / 64;
-  out.reserve(out.size() + (count < maxByBytes ? count : maxByBytes));
-  const char* p = r.p;
-  const char* end = r.end;
-  for (uint32_t i = 0; i < count; ++i) {
-    Event e;
-    if (!readEventRecord(p, end, version, e)) return errc(ERROR_INVALID_DATA);
-    out.push_back(std::move(e));
-  }
+  if (!r.ok) return errc(ERROR_INVALID_DATA);
+  p_ = r.p;
+  end_ = end;
+  recordsRead_ = 0;
   return {};
+}
+
+bool PmxlogReader::next(Event& e) {
+  if (err_) return false;
+  if (declaredCount_ > 0) {
+    // Trust the header count exactly, like the old whole-file loader: stop
+    // cleanly once it's satisfied, but a short file still fails as truncated
+    // (readEventRecord bounds-checks) rather than silently under-reading.
+    if (recordsRead_ >= declaredCount_) return false;
+  } else if (p_ >= end_) {
+    // count==0 with no data following is a genuinely empty log; count==0 with
+    // data following (see class comment) is handled below by reading on.
+    return false;
+  }
+  if (!readEventRecord(p_, end_, version_, e)) {
+    err_ = errc(ERROR_INVALID_DATA);
+    return false;
+  }
+  ++recordsRead_;
+  return true;
+}
+
+std::error_code loadEvents(const wchar_t* path, std::vector<Event>& out) {
+  PmxlogReader r;
+  if (std::error_code ec = r.open(path)) return ec;
+  Event e;
+  while (r.next(e)) out.push_back(std::move(e));
+  return r.error();
 }
 
 }  // namespace pmx

@@ -37,6 +37,7 @@ pmx net     [--count N] [--save F] [--csv F] [--pml F] [--json F|-] [--out F] [-
             [--config F] [--buffer-mb N] [--spool-dir DIR]
 pmx open    FILE.(pmxlog|pml) [filters] [--class C] [--count N]
             [--csv F] [--pml F] [--json F|-] [--summary] [--quiet]
+            [--config F] [--buffer-mb N] [--spool-dir DIR]
 pmx summary FILE.(pmxlog|pml) [--by path|proc|pid|op|result|class] [--top N] [filters]
 pmx filters FILE|DIR...
 pmx elevate <args…>
@@ -88,6 +89,12 @@ Reload a saved `.pmxlog` or a `.pml` (written by `pmx` or by Process Monitor;
 64-bit logs, format v4–v9) and filter / export it offline. Accepts the same
 filters and the `--csv` / `--pml` / `--json` exporters. `--summary` prints the
 summary table (see below) instead of rows; `--quiet` suppresses rows.
+`open` streams through the file instead of loading it whole, so reopening an
+arbitrarily large `live` capture doesn't need to fit in RAM; `--csv`/`--pml`/
+`--json FILE` route the filtered events through the same RAM-bounded spool
+`live` uses, with the same `--config F` / `--buffer-mb N` / `--spool-dir DIR`
+options (see §5, *Memory & spill*). `--summary` (or the `summary` command)
+does not write those files, even if given alongside them.
 
 ### `pmx summary FILE`
 Group the filtered events and print count, share, and failed-count per key, most

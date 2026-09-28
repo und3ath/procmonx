@@ -11,6 +11,7 @@ add_executable(pmx_tests
   test_pml.cpp
   test_spool.cpp
   test_writers.cpp
+  test_readers.cpp
 )
 target_link_libraries(pmx_tests PRIVATE pmx_core)
 add_test(NAME pmx_tests COMMAND pmx_tests)

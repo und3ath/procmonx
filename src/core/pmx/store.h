@@ -23,6 +23,32 @@ std::error_code saveEvents(const wchar_t* path, std::span<const Event> events);
 // Load events from a native .pmxlog file (appends to `out`).
 std::error_code loadEvents(const wchar_t* path, std::vector<Event>& out);
 
+// Streaming .pmxlog reader backing loadEvents: memory-maps the file and
+// decodes one event per next() call, so a caller with more events than fit
+// comfortably in RAM (a reopened `live` capture) doesn't need a second
+// in-memory copy of the whole file. open() validates magic/version exactly
+// as loadEvents does. next() returns false at end of file or on a malformed
+// record (then error() is ERROR_INVALID_DATA); a header count of 0 with
+// record bytes still following (a writer that died before patching the
+// count) is recovered by reading until the data runs out instead of
+// stopping immediately.
+class PmxlogReader {
+ public:
+  std::error_code open(const wchar_t* path);
+  bool next(Event& e);
+  std::error_code error() const { return err_; }
+  uint32_t declaredCount() const { return declaredCount_; }
+
+ private:
+  MappedFile file_;
+  uint32_t version_ = 0;
+  uint32_t declaredCount_ = 0;
+  uint32_t recordsRead_ = 0;
+  const char* p_ = nullptr;
+  const char* end_ = nullptr;
+  std::error_code err_;
+};
+
 // Export events to a CSV file (Excel/grep friendly): Time, Process Name, PID,
 // Operation, Path, Result, Detail, Duration.
 std::error_code saveEventsCsv(const wchar_t* path, std::span<const Event> events);

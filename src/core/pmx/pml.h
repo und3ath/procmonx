@@ -38,4 +38,27 @@ class PmlWriter {
 // Returns ERROR_NOT_SUPPORTED for 32-bit logs, ERROR_INVALID_DATA if the file
 // is malformed.
 std::error_code loadPml(const wchar_t* path, std::vector<Event>& out);
+
+// Streaming .pml reader backing loadPml: open() memory-maps the file and does
+// the header/strings/process-table/hosts-ports parsing once; next() then
+// decodes one event at a time (skipping class-0 completion records) without
+// holding the whole file or the decoded event list in memory. Same error
+// codes as loadPml; next() returns false at end of file or on a malformed
+// record (then error() is set).
+class PmlReader {
+ public:
+  PmlReader();
+  ~PmlReader();
+  PmlReader(const PmlReader&) = delete;
+  PmlReader& operator=(const PmlReader&) = delete;
+
+  std::error_code open(const wchar_t* path);
+  bool next(Event& e);
+  std::error_code error() const;
+  uint32_t declaredCount() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 }
