@@ -76,7 +76,10 @@ std::error_code loadFilterConfig(const wchar_t* path, pmx::FilterSet& out,
                                  std::string* why = nullptr);
 
 // Load every config in a directory as its own lens (see FilterGroup).
-std::error_code loadFilterDir(const wchar_t* dir, pmx::FilterGroup& out);
+// Fails on a directory with no configs or any config that doesn't load; `why`
+// names the file and reason.
+std::error_code loadFilterDir(const wchar_t* dir, pmx::FilterGroup& out,
+                              std::string* why = nullptr);
 
 // Consume argv[i] (and its value) if it is a filter option; advances `i`.
 bool parseFilterArg(int argc, wchar_t** argv, int& i, FilterCli& fc);

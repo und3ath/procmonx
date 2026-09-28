@@ -139,7 +139,9 @@ Includes regardless of column.
 an independent rule set with its own includes/excludes and match mode. Lenses
 combine with `--groups any` (OR, default) or `--groups all` (AND) — one lens's
 excludes never suppress another lens's includes. The command-line `-f`/`-x` rules
-plus the shortcuts form one more set, AND'd with the lens group.
+plus the shortcuts form one more set, AND'd with the lens group. A config that
+fails to load is an error (for `--filter-dir` too, as is a directory with no
+`.json`/`.reg`/`.pmc` files) — a silently missing lens would widen the filter.
 
 **Shortcuts:**
 - `--pid N` → `PID is N`, `--proc NAME` → `ProcessName is NAME` (both repeatable);

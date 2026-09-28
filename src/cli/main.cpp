@@ -413,8 +413,9 @@ int cmdFilters(int argc, wchar_t** argv) {
   for (int i = 0; i < argc; ++i) {
     DWORD attr = GetFileAttributesW(argv[i]);
     if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-      std::error_code ec = loadFilterDir(argv[i], group);
-      if (ec) { printError("filters", ec); return 2; }
+      std::string why;
+      std::error_code ec = loadFilterDir(argv[i], group, &why);
+      if (ec) { printError("filters", ec, why); return 2; }
     } else {
       pmx::FilterSet fs;
       std::string why;

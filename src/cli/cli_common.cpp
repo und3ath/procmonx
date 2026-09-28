@@ -105,7 +105,8 @@ std::error_code loadFilterConfig(const wchar_t* path, pmx::FilterSet& out,
   return pmx::loadFilterJson(path, out, why);
 }
 
-std::error_code loadFilterDir(const wchar_t* dir, pmx::FilterGroup& out) {
+std::error_code loadFilterDir(const wchar_t* dir, pmx::FilterGroup& out,
+                              std::string* why) {
   std::wstring pattern = std::wstring(dir) + L"\\*";
   WIN32_FIND_DATAW fd{};
   HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
@@ -124,24 +125,25 @@ std::error_code loadFilterDir(const wchar_t* dir, pmx::FilterGroup& out) {
   } while (FindNextFileW(h, &fd));
   FindClose(h);
   std::sort(files.begin(), files.end());
+  // A missing or broken lens must not silently widen the filter (lenses OR).
+  if (files.empty()) {
+    if (why) *why = "no .json/.reg/.pmc filter configs in " + toUtf8(dir, -1);
+    return {ERROR_FILE_NOT_FOUND, std::system_category()};
+  }
 
   for (const auto& name : files) {
     std::wstring full = std::wstring(dir) + L"\\" + name;
     pmx::FilterSet set;
-    std::string why;
-    std::error_code ec = loadFilterConfig(full.c_str(), set, &why);
-    if (ec) {
-      if (why.empty())
-        errf("filter-dir: skipped %ls (%s)\n", name.c_str(), ec.message().c_str());
-      else
-        errf("filter-dir: skipped %ls (%s: %s)\n", name.c_str(),
-             ec.message().c_str(), why.c_str());
-    } else {
-      if (set.rules().empty())
-        errf("filter %ls: no rules - this lens matches every event\n", name.c_str());
-      out.addSet(std::move(set));
-      errf("filter-dir: loaded %ls\n", name.c_str());
+    std::string reason;
+    if (std::error_code ec = loadFilterConfig(full.c_str(), set, &reason)) {
+      if (why)
+        *why = toUtf8(name.c_str(), -1) + (reason.empty() ? "" : ": " + reason);
+      return ec;
     }
+    if (set.rules().empty())
+      errf("filter %ls: no rules - this lens matches every event\n", name.c_str());
+    out.addSet(std::move(set));
+    errf("filter-dir: loaded %ls\n", name.c_str());
   }
   return {};
 }
@@ -191,9 +193,10 @@ int buildFilters(const FilterCli& fc, pmx::FilterSet& cliSet,
     lenses.setMode(*g);
   }
   if (fc.dir) {
-    std::error_code fe = loadFilterDir(fc.dir, lenses);
+    std::string why;
+    std::error_code fe = loadFilterDir(fc.dir, lenses, &why);
     if (fe) {
-      printError("filter-dir", fe);
+      printError("filter-dir", fe, why);
       return 2;
     }
   }
