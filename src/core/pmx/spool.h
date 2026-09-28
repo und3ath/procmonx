@@ -48,6 +48,10 @@ class EventSpool {
   // background spill failed (see below).
   std::error_code add(const Event& ev, uint8_t tag);
 
+  // Creates and deletes a file in the spool dir, so a bad dir fails up front
+  // rather than at the first spill, possibly long into a capture.
+  std::error_code checkDir() const;
+
   uint64_t count() const;
   // Number of runs spilled so far; may include one currently being written
   // by the background worker (its handle isn't usable until that finishes -
@@ -99,6 +103,8 @@ class EventSpool {
   // stable_sort + write b's records to a fresh run file. Touches no shared
   // state, so it runs on the worker thread without the lock.
   std::error_code spillBuffer(Buffer& b, size_t runIndex, SpillResult& out) const;
+  // <dir>\pmx-spool-<pid>-<tag>.tmp, delete-on-close.
+  HANDLE createTemp(const std::wstring& tag) const;
 
   SpoolOptions opt_;
   size_t halfBudget_;

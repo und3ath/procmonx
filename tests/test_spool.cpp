@@ -253,6 +253,21 @@ int test_spool() {
     CHECK(delivered > 0);  // the in-memory buffer isn't thrown away
   }
 
+  // checkDir(): a missing dir fails up front; the default temp dir works and
+  // leaves no probe file behind.
+  {
+    SpoolOptions bad;
+    bad.dir = L"Z:\\pmx_no_such_dir\\x";
+    CHECK(!!EventSpool(bad).checkDir());
+    CHECK(!EventSpool(SpoolOptions{}).checkDir());
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const std::wstring probe = std::wstring(tmp) + L"pmx-spool-" +
+                               std::to_wstring(GetCurrentProcessId()) +
+                               L"-probe.tmp";
+    CHECK(GetFileAttributesW(probe.c_str()) == INVALID_FILE_ATTRIBUTES);
+  }
+
   // 7) Destructor with a spill still in flight (torn down right after a big
   // batch of adds, before the worker could plausibly have caught up): no
   // crash, and every run file is still cleaned up (FILE_FLAG_DELETE_ON_CLOSE).

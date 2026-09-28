@@ -674,6 +674,7 @@ int cmdOpenOrSummary(int argc, wchar_t** argv, bool summary) {
   std::optional<pmx::EventSpool> spool;
   const bool jsonFile = jsonPath && !jsonStdout;
   if (!summaryMode && (csvPath || pmlPath || jsonFile)) {
+    if (checkSpoolDir(pmxConfig)) return 2;
     pmx::SpoolOptions sopt;
     sopt.bufferBytes = pmxConfig.bufferMb << 20;
     sopt.dir = pmxConfig.spoolDir;
@@ -832,6 +833,8 @@ int cmdLive(int argc, wchar_t** argv) {
   // --json - streams records to stdout in place of table rows.
   g_jsonStdout = jsonPath && !wcscmp(jsonPath, L"-");
   const bool jsonFile = jsonPath && !g_jsonStdout;
+  if ((savePath || csvPath || jsonFile || pmlPath) && checkSpoolDir(pmxConfig))
+    return 2;
 
   // --out mirrors output to a file (tee); the console still shows it unless
   // --silent. (Needed for `pmx elevate live --out …`: the elevated child has its
@@ -1073,6 +1076,8 @@ int cmdNet(int argc, wchar_t** argv) {
   SetConsoleOutputCP(CP_UTF8);
   g_jsonStdout = jsonPath && !wcscmp(jsonPath, L"-");
   const bool jsonFile = jsonPath && !g_jsonStdout;
+  if ((savePath || csvPath || jsonFile || pmlPath) && checkSpoolDir(pmxConfig))
+    return 2;
   if (outPath) {
     g_outFile = _wfopen(outPath, L"w");
     if (!g_outFile) {

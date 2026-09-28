@@ -145,6 +145,24 @@ bool decodeAt(const std::string& buf, uint64_t offset, Event& e, uint8_t& tag) {
 }
 }  // namespace
 
+HANDLE EventSpool::createTemp(const std::wstring& tag) const {
+  const std::wstring dir = opt_.dir.empty() ? defaultTempDir() : opt_.dir;
+  const std::wstring path = dir + L"\\pmx-spool-" +
+                            std::to_wstring(GetCurrentProcessId()) + L"-" + tag +
+                            L".tmp";
+  return CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                     CREATE_ALWAYS,
+                     FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                     nullptr);
+}
+
+std::error_code EventSpool::checkDir() const {
+  HANDLE h = createTemp(L"probe");
+  if (h == INVALID_HANDLE_VALUE) return errc((int)GetLastError());
+  CloseHandle(h);
+  return {};
+}
+
 EventSpool::EventSpool(SpoolOptions opt)
     : opt_(std::move(opt)), halfBudget_(std::max<size_t>(opt_.bufferBytes / 2, 1)) {}
 
@@ -263,14 +281,7 @@ std::error_code EventSpool::spillBuffer(Buffer& b, size_t runIndex,
     return keyLess(a.ts, a.seq, c.ts, c.seq);
   });
 
-  const std::wstring dir = opt_.dir.empty() ? defaultTempDir() : opt_.dir;
-  wchar_t path[MAX_PATH];
-  swprintf(path, MAX_PATH, L"%s\\pmx-spool-%lu-%zu.tmp", dir.c_str(),
-          GetCurrentProcessId(), runIndex);
-  HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                        CREATE_ALWAYS,
-                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
-                        nullptr);
+  HANDLE h = createTemp(std::to_wstring(runIndex));
   if (h == INVALID_HANDLE_VALUE) return errc((int)GetLastError());
 
   ChunkWriter w;

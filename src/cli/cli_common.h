@@ -104,6 +104,10 @@ struct PmxConfig {
 // after printing the error.
 int loadPmxConfig(const wchar_t* explicitPath, PmxConfig& out);
 
+// Verify the spool dir is writable before any capture starts. Returns 0, or 2
+// after printing the error.
+int checkSpoolDir(const PmxConfig& cfg);
+
 // ---- live/net spool finalize --------------------------------------------------
 // Output file paths for a live/net capture's spool drain; null = not requested.
 struct LiveOutputPaths {

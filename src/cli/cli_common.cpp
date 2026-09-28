@@ -382,6 +382,18 @@ int loadPmxConfig(const wchar_t* explicitPath, PmxConfig& out) {
   return 0;
 }
 
+int checkSpoolDir(const PmxConfig& cfg) {
+  pmx::SpoolOptions opt;
+  opt.dir = cfg.spoolDir;
+  if (std::error_code ec = pmx::EventSpool(opt).checkDir()) {
+    errf("spool dir %ls: [%d] %s\n",
+         cfg.spoolDir.empty() ? L"(%TEMP%)" : cfg.spoolDir.c_str(), ec.value(),
+         ec.message().c_str());
+    return 2;
+  }
+  return 0;
+}
+
 int finalizeSpool(pmx::EventSpool& spool, const LiveOutputPaths& paths,
                   bool unfiltered) {
   pmx::PmxlogWriter pmxw;
