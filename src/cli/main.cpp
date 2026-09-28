@@ -380,8 +380,9 @@ int cmdFilters(int argc, wchar_t** argv) {
     DWORD attr = GetFileAttributesW(argv[0]);
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
       pmx::FilterSet fs;
-      std::error_code ec = loadFilterConfig(argv[0], fs);
-      if (ec) { printError("filters", ec); return 2; }
+      std::string why;
+      std::error_code ec = loadFilterConfig(argv[0], fs, &why);
+      if (ec) { printError("filters", ec, why); return 2; }
       printSet(fs);
       return 0;
     }
@@ -396,8 +397,9 @@ int cmdFilters(int argc, wchar_t** argv) {
       if (ec) { printError("filters", ec); return 2; }
     } else {
       pmx::FilterSet fs;
-      std::error_code ec = loadFilterConfig(argv[i], fs);
-      if (ec) { printError("filters", ec); return 2; }
+      std::string why;
+      std::error_code ec = loadFilterConfig(argv[i], fs, &why);
+      if (ec) { printError("filters", ec, why); return 2; }
       group.addSet(std::move(fs));
     }
   }

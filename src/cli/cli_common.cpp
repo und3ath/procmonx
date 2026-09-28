@@ -79,6 +79,13 @@ void printError(const char* what, std::error_code ec) {
   errf("%s: [%d] %s\n", what, ec.value(), ec.message().c_str());
 }
 
+void printError(const char* what, std::error_code ec, const std::string& why) {
+  if (why.empty())
+    printError(what, ec);
+  else
+    errf("%s: [%d] %s: %s\n", what, ec.value(), ec.message().c_str(), why.c_str());
+}
+
 std::string toUtf8(const wchar_t* s, int len) {
   if (!s || len == 0) return {};
   int n = WideCharToMultiByte(CP_UTF8, 0, s, len, nullptr, 0, nullptr, nullptr);
@@ -89,11 +96,12 @@ std::string toUtf8(const wchar_t* s, int len) {
   return out;
 }
 
-std::error_code loadFilterConfig(const wchar_t* path, pmx::FilterSet& out) {
+std::error_code loadFilterConfig(const wchar_t* path, pmx::FilterSet& out,
+                                 std::string* why) {
   const wchar_t* dot = wcsrchr(path, L'.');
   if (dot && (!_wcsicmp(dot, L".reg") || !_wcsicmp(dot, L".pmc")))
     return pmx::loadFilterReg(path, out);
-  return pmx::loadFilterJson(path, out);
+  return pmx::loadFilterJson(path, out, why);
 }
 
 std::error_code loadFilterDir(const wchar_t* dir, pmx::FilterGroup& out) {
@@ -119,10 +127,17 @@ std::error_code loadFilterDir(const wchar_t* dir, pmx::FilterGroup& out) {
   for (const auto& name : files) {
     std::wstring full = std::wstring(dir) + L"\\" + name;
     pmx::FilterSet set;
-    std::error_code ec = loadFilterConfig(full.c_str(), set);
+    std::string why;
+    std::error_code ec = loadFilterConfig(full.c_str(), set, &why);
     if (ec) {
-      errf("filter-dir: skipped %ls (%s)\n", name.c_str(), ec.message().c_str());
+      if (why.empty())
+        errf("filter-dir: skipped %ls (%s)\n", name.c_str(), ec.message().c_str());
+      else
+        errf("filter-dir: skipped %ls (%s: %s)\n", name.c_str(),
+             ec.message().c_str(), why.c_str());
     } else {
+      if (set.rules().empty())
+        errf("filter %ls: no rules - this lens matches every event\n", name.c_str());
       out.addSet(std::move(set));
       errf("filter-dir: loaded %ls\n", name.c_str());
     }
@@ -183,11 +198,18 @@ int buildFilters(const FilterCli& fc, pmx::FilterSet& cliSet,
   }
   for (const wchar_t* f : fc.files) {
     pmx::FilterSet set;
-    std::error_code fe = loadFilterConfig(f, set);
+    std::string why;
+    std::error_code fe = loadFilterConfig(f, set, &why);
     if (fe) {
-      errf("filter-file %ls: [%d] %s\n", f, fe.value(), fe.message().c_str());
+      if (why.empty())
+        errf("filter-file %ls: [%d] %s\n", f, fe.value(), fe.message().c_str());
+      else
+        errf("filter-file %ls: [%d] %s: %s\n", f, fe.value(), fe.message().c_str(),
+             why.c_str());
       return 2;
     }
+    if (set.rules().empty())
+      errf("filter %ls: no rules - this lens matches every event\n", f);
     lenses.addSet(std::move(set));
   }
   for (const auto& s : fc.includes) {

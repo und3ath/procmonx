@@ -178,6 +178,122 @@ int test_filter() {
     DeleteFileW(path.c_str());
   }
 
+  // Malformed rules: rejected (not silently dropped/inverted), with a `why`
+  // naming the 1-based rule index.
+  {
+    auto tryLoad = [](const char* body, std::string& why) {
+      wchar_t dir[MAX_PATH];
+      GetTempPathW(MAX_PATH, dir);
+      std::wstring path = std::wstring(dir) + L"pmx_test_filter_bad.json";
+      HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+      DWORD w = 0;
+      WriteFile(h, body, (DWORD)std::strlen(body), &w, nullptr);
+      CloseHandle(h);
+      FilterSet fs;
+      std::error_code ec = loadFilterJson(path.c_str(), fs, &why);
+      DeleteFileW(path.c_str());
+      return ec;
+    };
+
+    // Unknown column.
+    {
+      std::string why;
+      auto ec = tryLoad(
+          "{ \"filters\": ["
+          "{\"column\":\"Path\",\"relation\":\"is\",\"value\":\"x\"},"
+          "{\"column\":\"Proces\",\"relation\":\"is\",\"value\":\"x\"} ] }",
+          why);
+      CHECK(ec);
+      CHECK(why.find("rule 2") != std::string::npos);
+      CHECK(why.find("Proces") != std::string::npos);
+    }
+    // Unknown relation.
+    {
+      std::string why;
+      auto ec = tryLoad(
+          "{ \"filters\": ["
+          "{\"column\":\"Path\",\"relation\":\"bogus\",\"value\":\"x\"} ] }",
+          why);
+      CHECK(ec);
+      CHECK(why.find("rule 1") != std::string::npos);
+      CHECK(why.find("bogus") != std::string::npos);
+    }
+    // Bad action (typo doesn't silently invert to include).
+    {
+      std::string why;
+      auto ec = tryLoad(
+          "{ \"filters\": ["
+          "{\"column\":\"Path\",\"relation\":\"is\",\"value\":\"x\",\"action\":\"exlude\"} ] }",
+          why);
+      CHECK(ec);
+      CHECK(why.find("rule 1") != std::string::npos);
+      CHECK(why.find("exlude") != std::string::npos);
+      CHECK(why.find("include|exclude") != std::string::npos);
+    }
+    // Missing column.
+    {
+      std::string why;
+      auto ec = tryLoad(
+          "{ \"filters\": [ {\"relation\":\"is\",\"value\":\"x\"} ] }", why);
+      CHECK(ec);
+      CHECK(why.find("rule 1") != std::string::npos);
+      CHECK(why.find("missing column") != std::string::npos);
+    }
+    // Action is accepted case-insensitively.
+    {
+      std::string why;
+      auto ec = tryLoad(
+          "{ \"filters\": ["
+          "{\"column\":\"Path\",\"relation\":\"is\",\"value\":\"x\",\"action\":\"EXCLUDE\"},"
+          "{\"column\":\"Path\",\"relation\":\"is\",\"value\":\"y\",\"action\":\"Include\"} ] }",
+          why);
+      CHECK(!ec);
+    }
+    // Missing action defaults to include.
+    {
+      std::string why;
+      FilterSet fs;
+      wchar_t dir[MAX_PATH];
+      GetTempPathW(MAX_PATH, dir);
+      std::wstring path = std::wstring(dir) + L"pmx_test_filter_defact.json";
+      const char body[] =
+          "{ \"filters\": [ {\"column\":\"Path\",\"relation\":\"is\",\"value\":\"x\"} ] }";
+      HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+      DWORD w = 0;
+      WriteFile(h, body, sizeof body - 1, &w, nullptr);
+      CloseHandle(h);
+      CHECK(!loadFilterJson(path.c_str(), fs, &why));
+      DeleteFileW(path.c_str());
+      CHECK(fs.rules().size() == 1);
+      if (fs.rules().size() == 1) CHECK(fs.rules()[0].action == Action::Include);
+    }
+  }
+
+  // Every shipped hunt lens must still load cleanly.
+  {
+    std::wstring dir = std::wstring(L"" PMX_SOURCE_DIR) + L"\\conf\\hunt";
+    std::wstring pattern = dir + L"\\*.json";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    int count = 0;
+    if (h != INVALID_HANDLE_VALUE) {
+      do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring full = dir + L"\\" + fd.cFileName;
+        FilterSet fs;
+        std::string why;
+        std::error_code ec = loadFilterJson(full.c_str(), fs, &why);
+        CHECK(!ec);
+        ++count;
+      } while (FindNextFileW(h, &fd));
+      FindClose(h);
+    }
+    CHECK(count > 0);
+  }
+
   // Numeric isNot with a non-numeric value always matches; is never does.
   {
     FilterSet fs;

@@ -14,4 +14,5 @@ add_executable(pmx_tests
   test_readers.cpp
 )
 target_link_libraries(pmx_tests PRIVATE pmx_core)
+target_compile_definitions(pmx_tests PRIVATE PMX_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME pmx_tests COMMAND pmx_tests)

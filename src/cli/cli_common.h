@@ -39,6 +39,8 @@ void errf(const char* fmt, ...);        // stderr (never silenced, not tee'd)
 void statusf(const char* fmt, ...);     // outf, or stderr under --json -
 void writeJsonRow(const pmx::Event& ev);
 void printError(const char* what, std::error_code ec);
+// Same, with a why message appended as ": <why>" when non-empty.
+void printError(const char* what, std::error_code ec, const std::string& why);
 
 // Convert `len` wchars (or -1 for a NUL-terminated string) to UTF-8. A -1 length
 // drops the terminating NUL from the result.
@@ -64,7 +66,10 @@ struct FilterCli {
 };
 
 // Load one filter config, dispatching by extension: .reg / .pmc, else JSON.
-std::error_code loadFilterConfig(const wchar_t* path, pmx::FilterSet& out);
+// `why`, if non-null, receives a short failure reason for JSON configs (empty
+// for .reg/.pmc).
+std::error_code loadFilterConfig(const wchar_t* path, pmx::FilterSet& out,
+                                 std::string* why = nullptr);
 
 // Load every config in a directory as its own lens (see FilterGroup).
 std::error_code loadFilterDir(const wchar_t* dir, pmx::FilterGroup& out);

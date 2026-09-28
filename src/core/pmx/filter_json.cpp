@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cctype>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -29,6 +30,15 @@ std::string wToUtf8(const std::wstring& s) {
   WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), o.data(), n, nullptr,
                       nullptr);
   return o;
+}
+
+// ASCII case-insensitive equality (action/match keywords are always ASCII).
+bool ieq(const std::string& s, const char* lit) {
+  size_t i = 0;
+  for (; s[i] && lit[i]; ++i)
+    if (std::tolower((unsigned char)s[i]) != std::tolower((unsigned char)lit[i]))
+      return false;
+  return s[i] == '\0' && lit[i] == '\0';
 }
 
 // --- Minimal JSON scanner (objects/arrays/strings; numbers/bools skipped) ----
@@ -141,7 +151,13 @@ struct Json {
 };
 }  // namespace
 
-std::error_code loadFilterJson(const wchar_t* path, FilterSet& out) {
+std::error_code loadFilterJson(const wchar_t* path, FilterSet& out,
+                               std::string* why) {
+  auto fail = [&](const char* msg) {
+    if (why) *why = msg;
+    return errc(ERROR_INVALID_DATA);
+  };
+
   std::string buf;
   if (std::error_code ec = readWholeFile(path, buf)) return ec;
   // Tolerate a UTF-8 BOM (Notepad / PowerShell 5 `-Encoding UTF8` write one).
@@ -151,62 +167,80 @@ std::error_code loadFilterJson(const wchar_t* path, FilterSet& out) {
     start = 3;
 
   Json j{buf.data() + start, buf.data() + buf.size()};
-  if (!j.eat('{')) return errc(ERROR_INVALID_DATA);
+  if (!j.eat('{')) return fail("malformed JSON");
   bool foundFilters = false;
   while (true) {
     std::string key;
     if (!j.str(key)) break;
-    if (!j.eat(':')) return errc(ERROR_INVALID_DATA);
+    if (!j.eat(':')) return fail("malformed JSON");
     if (key == "match") {
       // Include combination mode for this file's lens: "procmon" (default:
       // same column OR'd, columns AND'd) or "any" (all includes OR'd).
       std::string v;
-      if (!j.str(v)) return errc(ERROR_INVALID_DATA);
+      if (!j.str(v)) return fail("malformed JSON");
       auto m = parseIncludeMode(utf8ToW(v));
-      if (!m) return errc(ERROR_INVALID_DATA);
+      if (!m) return fail(("unknown match \"" + v + "\"").c_str());
       out.setIncludeMode(*m);
     } else if (key == "filters") {
       foundFilters = true;
-      if (!j.eat('[')) return errc(ERROR_INVALID_DATA);
+      if (!j.eat('[')) return fail("malformed JSON");
       if (!j.eat(']')) {  // non-empty array
+        int idx = 0;
         do {
-          if (!j.eat('{')) return errc(ERROR_INVALID_DATA);
-          std::string col, rel, val, act = "include";
+          ++idx;
+          if (!j.eat('{')) return fail("malformed JSON");
+          std::string col, rel, val, act;
+          bool hasCol = false, hasRel = false, hasAct = false;
           while (true) {
             std::string k;
             if (!j.str(k)) break;
-            if (!j.eat(':')) return errc(ERROR_INVALID_DATA);
+            if (!j.eat(':')) return fail("malformed JSON");
             std::string v;
             if (!j.str(v) && !j.primitive(v)) {
               j.skipValue();
             } else if (k == "column") {
               col = v;
+              hasCol = true;
             } else if (k == "relation") {
               rel = v;
+              hasRel = true;
             } else if (k == "value") {
               val = v;
             } else if (k == "action") {
               act = v;
+              hasAct = true;
             }
             if (!j.eat(',')) break;
           }
-          if (!j.eat('}')) return errc(ERROR_INVALID_DATA);
+          if (!j.eat('}')) return fail("malformed JSON");
+          std::string ruleTag = "rule " + std::to_string(idx) + ": ";
+          if (!hasCol) return fail((ruleTag + "missing column").c_str());
+          if (!hasRel) return fail((ruleTag + "missing relation").c_str());
           auto c = parseColumn(utf8ToW(col));
+          if (!c)
+            return fail((ruleTag + "unknown column \"" + col + "\"").c_str());
           auto r = parseRelation(utf8ToW(rel));
-          if (c && r) {
-            Action a = (act == "exclude" || act == "Exclude") ? Action::Exclude
-                                                              : Action::Include;
-            out.add(Rule{*c, *r, utf8ToW(val), a});
+          if (!r)
+            return fail((ruleTag + "unknown relation \"" + rel + "\"").c_str());
+          Action a = Action::Include;
+          if (hasAct) {
+            if (ieq(act, "exclude")) a = Action::Exclude;
+            else if (ieq(act, "include")) a = Action::Include;
+            else
+              return fail((ruleTag + "unknown action \"" + act +
+                          "\" (want include|exclude)")
+                             .c_str());
           }
+          out.add(Rule{*c, *r, utf8ToW(val), a});
         } while (j.eat(','));
-        if (!j.eat(']')) return errc(ERROR_INVALID_DATA);
+        if (!j.eat(']')) return fail("malformed JSON");
       }
     } else {
       j.skipValue();
     }
     if (!j.eat(',')) break;
   }
-  if (!foundFilters) return errc(ERROR_INVALID_DATA);
+  if (!foundFilters) return fail("missing \"filters\" array");
   return {};
 }
 
