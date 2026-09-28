@@ -443,6 +443,16 @@ int test_filter() {
     }
   }
 
+  // Case-insensitive beyond ASCII (accented / Cyrillic names and paths).
+  {
+    FilterSet fs;
+    fs.add(*parseRule(L"Path contains \\Été\\", Action::Include));
+    CHECK(fs.matches(mk(L"a", 1, "op", L"C:\\users\\été\\x", 0)));
+    FilterSet ru;
+    ru.add(*parseRule(L"ProcessName is ПРОГРАММА.exe", Action::Include));
+    CHECK(ru.matches(mk(L"программа.EXE", 1, "op", L"p", 0)));
+  }
+
   // Procmon's spellings match our names.
   {
     FilterSet fs;

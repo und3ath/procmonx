@@ -1,5 +1,7 @@
 #include "pmx/filter.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cwchar>
@@ -9,9 +11,26 @@
 namespace pmx {
 
 namespace {
+// Locale-independent simple lowercase for every UTF-16 unit (towlower in the
+// C locale only folds ASCII, so "É" never matched "é").
+wchar_t fold(wchar_t c) {
+  if (c < 0x80) return (c >= L'A' && c <= L'Z') ? c + 32 : c;
+  static const std::vector<wchar_t> table = [] {
+    std::vector<wchar_t> t(0x10000);
+    for (uint32_t i = 0; i < 0x10000; ++i) {
+      wchar_t in = static_cast<wchar_t>(i), out = in;
+      if (i >= 0x80 && (i < 0xD800 || i > 0xDFFF))
+        LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, &in, 1, &out, 1,
+                      nullptr, nullptr, 0);
+      t[i] = out;
+    }
+    return t;
+  }();
+  return table[c];
+}
+
 std::wstring lower(std::wstring s) {
-  std::transform(s.begin(), s.end(), s.begin(),
-                 [](wchar_t c) { return towlower(c); });
+  for (auto& c : s) c = fold(c);
   return s;
 }
 
@@ -55,14 +74,14 @@ bool parseNumber(const std::wstring& s, uint64_t& out) {
 struct WFolder {
   const wchar_t* s;
   size_t n;
-  wchar_t at(size_t i) const { return towlower(s[i]); }
+  wchar_t at(size_t i) const { return fold(s[i]); }
   size_t size() const { return n; }
 };
 struct AFolder {
   const char* s;
   size_t n;
   wchar_t at(size_t i) const {
-    return static_cast<wchar_t>(towlower(static_cast<unsigned char>(s[i])));
+    return fold(static_cast<wchar_t>(static_cast<unsigned char>(s[i])));
   }
   size_t size() const { return n; }
 };
