@@ -215,6 +215,31 @@ int test_pml() {
   }
   _wremove(path);
 
+  // A RegQueryValue result larger than the u16 extra-details size must not
+  // corrupt the file (the following event still loads).
+  {
+    std::vector<Event> in(2);
+    in[0].eventClass = 2;
+    in[0].operation = 5;
+    in[0].regType = 3;  // REG_BINARY
+    in[0].path = L"\\REGISTRY\\MACHINE\\SOFTWARE\\big";
+    in[0].valueData.assign(70000, 0xAB);
+    in[0].timestamp = 1;
+    in[1].eventClass = 3;
+    in[1].operation = 20;
+    in[1].path = L"\\Device\\HarddiskVolume3\\after.txt";
+    in[1].timestamp = 2;
+    CHECK(!savePml(path, in));
+    std::vector<Event> out;
+    CHECK(!loadPml(path, out));
+    CHECK(out.size() == 2);
+    if (out.size() == 2) {
+      CHECK(out[0].valueData.size() == 0xFFFF - 12);  // capped, not wrapped
+      CHECK(out[1].path == in[1].path);
+    }
+    _wremove(path);
+  }
+
   // Enough events that the writer's offset array spills to its temp file
   // (1 MB of 5-byte entries): every event must still come back, in order.
   {

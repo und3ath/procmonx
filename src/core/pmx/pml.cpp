@@ -261,10 +261,12 @@ std::vector<uint8_t> buildExtraDetails(const Event& ev) {
       ev.regType < 12) {
     // RegQueryValue result (KeyValuePartialInformation): 4 pad, type, length,
     // data. The main detail already declares information_class = 2 (partial).
+    // The extra blob's size is a u16: cap the data so it can't wrap.
+    const size_t n = std::min<size_t>(ev.valueData.size(), 0xFFFF - 12);
     x.insert(x.end(), 4, 0);
     u32(ev.regType);
-    u32((uint32_t)ev.valueData.size());
-    x.insert(x.end(), ev.valueData.begin(), ev.valueData.end());
+    u32((uint32_t)n);
+    x.insert(x.end(), ev.valueData.begin(), ev.valueData.begin() + n);
   } else if (ev.eventClass == 2 && (ev.operation == 0 || ev.operation == 1) &&
              ev.completed && (ev.information == 1 || ev.information == 2)) {
     // RegOpenKey/RegCreateKey: {u32 granted access; u32 disposition}
