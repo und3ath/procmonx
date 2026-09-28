@@ -58,11 +58,31 @@ bool PidNameCache::resolve(uint32_t pid, Entry& e) {
   return true;
 }
 
+void PidNameCache::noteExitIfDone(Entry& e) {
+  if (!e.handle ||
+      WaitForSingleObject(static_cast<HANDLE>(e.handle), 0) == WAIT_TIMEOUT)
+    return;
+  FILETIME c, x, k, u;
+  e.exitTime = GetProcessTimes(static_cast<HANDLE>(e.handle), &c, &x, &k, &u)
+                   ? toU64(x)
+                   : fileTimeNow();
+  release(e);
+}
+
+void PidNameCache::sweep() {
+  for (auto& [pid, e] : map_) noteExitIfDone(e);
+}
+
 const std::wstring& PidNameCache::lookup(uint32_t pid, uint64_t eventTime) {
   static const std::wstring kIdle = L"Idle", kSystem = L"System";
   if (pid == 0) return kIdle;
   if (pid == 4) return kSystem;
   const uint64_t t = eventTime ? eventTime : fileTimeNow();
+  const uint64_t now = GetTickCount64();
+  if (now - lastSweep_ >= 10000) {
+    lastSweep_ = now;
+    sweep();
+  }
 
   auto it = map_.find(pid);
   if (it == map_.end()) {
@@ -72,16 +92,10 @@ const std::wstring& PidNameCache::lookup(uint32_t pid, uint64_t eventTime) {
   }
   Entry& e = it->second;
 
-  if (e.handle) {
-    if (WaitForSingleObject(static_cast<HANDLE>(e.handle), 0) == WAIT_TIMEOUT)
-      return e.name;  // still running: the handle pins the PID, name is valid
-    // Exited: remember when, then drop the handle so the PID can be reused.
-    FILETIME c, x, k, u;
-    e.exitTime = GetProcessTimes(static_cast<HANDLE>(e.handle), &c, &x, &k, &u)
-                     ? toU64(x)
-                     : fileTimeNow();
-    release(e);
-  }
+  // Still running: the handle pins the PID, so the name is valid. Exited:
+  // remember when, then drop the handle so the PID can be reused.
+  noteExitIfDone(e);
+  if (e.handle) return e.name;
 
   // Late event from the instance we cached (stamped before it exited).
   if (e.exitTime && t <= e.exitTime) return e.name;

@@ -41,8 +41,14 @@ class PidNameCache {
   // be opened; `e` then carries only the fallback name.
   static bool resolve(uint32_t pid, Entry& e);
   static void release(Entry& e);
+  // Record the exit + drop the handle of an entry whose process has exited.
+  static void noteExitIfDone(Entry& e);
+  // Periodically drop handles of exited processes that are never looked up
+  // again, so they don't stay pinned (as zombie objects) for the whole capture.
+  void sweep();
 
   std::unordered_map<uint32_t, Entry> map_;
+  uint64_t lastSweep_ = 0;  // GetTickCount64
 };
 
 }  // namespace pmx
