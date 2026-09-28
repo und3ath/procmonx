@@ -334,7 +334,68 @@ bool procResolved(const Event& ev) {
 // is flushed.
 struct PmlWriter::Impl {
   BufferedFile file;
-  std::vector<uint64_t> eventOffsets;  // one per write()'d (pmlWritable) event
+
+  // Events offset array entries, already in on-disk form ({u32 low, u8 high}).
+  // Past kOffBufCap they move to a delete-on-close temp file so a huge capture
+  // doesn't hold one entry per event in RAM until close().
+  static constexpr size_t kOffBufCap = size_t{1} << 20;
+  std::vector<uint8_t> offBuf;
+  HANDLE offFile = INVALID_HANDLE_VALUE;
+  uint64_t eventCount = 0;
+
+  ~Impl() {
+    if (offFile != INVALID_HANDLE_VALUE) CloseHandle(offFile);
+  }
+
+  static std::error_code writeAll(HANDLE h, const uint8_t* p, size_t n) {
+    while (n) {
+      DWORD done = 0;
+      const DWORD chunk = n > 0x40000000u ? 0x40000000u : (DWORD)n;
+      if (!WriteFile(h, p, chunk, &done, nullptr)) return errc((int)GetLastError());
+      if (!done) return errc(ERROR_WRITE_FAULT);
+      p += done;
+      n -= done;
+    }
+    return {};
+  }
+
+  std::error_code addOffset(uint64_t off) {
+    const uint32_t low = (uint32_t)(off & 0xFFFFFFFFull);
+    offBuf.insert(offBuf.end(), (const uint8_t*)&low, (const uint8_t*)&low + 4);
+    offBuf.push_back((uint8_t)((off >> 32) & 0xFF));
+    ++eventCount;
+    if (offBuf.size() < kOffBufCap) return {};
+    if (offFile == INVALID_HANDLE_VALUE) {
+      wchar_t dir[MAX_PATH + 1], name[MAX_PATH + 1];
+      if (!GetTempPathW(MAX_PATH, dir) || !GetTempFileNameW(dir, L"pmx", 0, name))
+        return errc((int)GetLastError());
+      offFile = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                            nullptr);
+      if (offFile == INVALID_HANDLE_VALUE) return errc((int)GetLastError());
+    }
+    std::error_code ec = writeAll(offFile, offBuf.data(), offBuf.size());
+    offBuf.clear();
+    return ec;
+  }
+
+  std::error_code copyOffsetsTo(BufferedFile& out) {
+    if (offFile != INVALID_HANDLE_VALUE) {
+      LARGE_INTEGER zero{};
+      if (!SetFilePointerEx(offFile, zero, nullptr, FILE_BEGIN))
+        return errc((int)GetLastError());
+      std::vector<uint8_t> chunk(kOffBufCap);
+      for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(offFile, chunk.data(), (DWORD)chunk.size(), &got, nullptr))
+          return errc((int)GetLastError());
+        if (!got) break;
+        if (std::error_code ec = out.write(chunk.data(), got)) return ec;
+      }
+    }
+    return out.write(offBuf.data(), offBuf.size());
+  }
 
   // String interning (process fields only), same as the old Step A.
   std::vector<std::wstring> strings;
@@ -399,6 +460,7 @@ std::error_code PmlWriter::open(const wchar_t* path) {
 std::error_code PmlWriter::write(const Event& ev) {
   if (!pmlWritable(ev)) return {};
   Impl& im = *impl_;
+  if (im.eventCount >= UINT32_MAX) return errc(ERROR_FILE_TOO_LARGE);  // u32 header count
   im.updateProcessTable(ev);
 
   const uint64_t offset = im.file.tell();
@@ -454,23 +516,16 @@ std::error_code PmlWriter::write(const Event& ev) {
     rec.insert(rec.end(), extra.begin(), extra.end());
   }
   if (std::error_code ec = im.file.write(rec.data(), rec.size())) return ec;
-  im.eventOffsets.push_back(offset);
-  return {};
+  return im.addOffset(offset);
 }
 
 std::error_code PmlWriter::close() {
   Impl& im = *impl_;
 
   // Events offset array ({u32 offset low32, u8 offset bits 32..39} per
-  // event; pml_read.cpp reads it the same way). Below 4 GB the high byte is
-  // 0, same as the old fixed "flags" byte this replaces.
+  // event; pml_read.cpp reads it the same way).
   const uint64_t eventsOffsetArrayOffset = im.file.tell();
-  for (uint64_t off : im.eventOffsets) {
-    const uint32_t low = (uint32_t)(off & 0xFFFFFFFFull);
-    const uint8_t high = (uint8_t)((off >> 32) & 0xFF);
-    if (std::error_code ec = im.file.write(&low, 4)) return ec;
-    if (std::error_code ec = im.file.write(&high, 1)) return ec;
-  }
+  if (std::error_code ec = im.copyOffsetsTo(im.file)) return ec;
 
   // Procmon's loader requires process-table indexes to be STRICTLY ascending;
   // first-seen order is rejected as corrupt.
@@ -575,7 +630,7 @@ std::error_code PmlWriter::close() {
   if (auto ec = patchWFixedF(0x0C, computerName ? computerName : L"PMX", 16)) return ec;
   if (auto ec = patchWFixedF(0x2C, L"C:\\Windows", 260)) return ec;
 
-  if (auto ec = patchU32F(0x234, (uint32_t)im.eventOffsets.size())) return ec;
+  if (auto ec = patchU32F(0x234, (uint32_t)im.eventCount)) return ec;
   if (auto ec = patchU64F(0x238, 0)) return ec;
   if (auto ec = patchU64F(0x240, 0x3A8)) return ec;  // events array: right after the header
   if (auto ec = patchU64F(0x248, eventsOffsetArrayOffset)) return ec;
@@ -598,7 +653,7 @@ std::error_code PmlWriter::close() {
   return im.file.close();
 }
 
-uint64_t PmlWriter::count() const { return impl_->eventOffsets.size(); }
+uint64_t PmlWriter::count() const { return impl_->eventCount; }
 
 std::error_code savePml(const wchar_t* path, const std::vector<Event>& all) {
   std::vector<const Event*> events;

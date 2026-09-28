@@ -214,5 +214,40 @@ int test_pml() {
     CHECK(!!loadPml(path, junk));
   }
   _wremove(path);
+
+  // Enough events that the writer's offset array spills to its temp file
+  // (1 MB of 5-byte entries): every event must still come back, in order.
+  {
+    const uint32_t n = 250000;
+    PmlWriter w;
+    CHECK(!w.open(path));
+    Event ev;
+    ev.eventClass = 4;  // Profiling: smallest framed detail
+    ev.operation = 0;
+    ev.processIndex = 7;
+    ev.pid = 1234;
+    ev.processName = L"a.exe";
+    for (uint32_t i = 0; i < n; ++i) {
+      ev.timestamp = 133700000000000000ull + i;
+      ev.tid = i;
+      CHECK(!w.write(ev));
+    }
+    CHECK(!w.close());
+    CHECK(w.count() == n);
+    PmlReader r;
+    CHECK(!r.open(path));
+    CHECK(r.declaredCount() == n);
+    Event got;
+    uint32_t i = 0;
+    bool inOrder = true;
+    while (r.next(got)) {
+      if (got.tid != i) inOrder = false;
+      ++i;
+    }
+    CHECK(!r.error());
+    CHECK(i == n);
+    CHECK(inOrder);
+    _wremove(path);
+  }
   return g_failures - before;
 }
