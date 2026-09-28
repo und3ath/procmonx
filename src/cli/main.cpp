@@ -46,6 +46,10 @@ namespace {
 pmx::PortClient* g_client = nullptr;
 pmx::NetTrace* g_netTrace = nullptr;
 std::atomic<bool> g_stop{false};
+// Manual-reset event, signaled in wmain right after the dispatched command
+// returns; ctrlHandler waits on it for CTRL_CLOSE/LOGOFF/SHUTDOWN_EVENT so it
+// can hold the process open long enough for finalizeSpool to close its files.
+HANDLE g_doneEvent = nullptr;
 
 // Scope guard for the globals the Ctrl-C handler and output helpers use: on
 // every return path of a command, drop pointers to objects about to be
@@ -167,6 +171,7 @@ int relaunchElevated(const std::wstring& args) {
 
 // Keep the elevated child's window open so its output can be read.
 void pauseBeforeExit(int rc) {
+  if (g_closeDeadline != 0) return;  // console is closing
   HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
   DWORD mode = 0;
   if (in == INVALID_HANDLE_VALUE || !GetConsoleMode(in, &mode)) return;
@@ -188,7 +193,22 @@ void ensureElevated(int argc, wchar_t** argv) {
 }
 
 BOOL WINAPI ctrlHandler(DWORD type) {
-  if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+  if (type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT ||
+      type == CTRL_SHUTDOWN_EVENT) {
+    // Windows terminates the process as soon as this handler returns (and in
+    // any case ~5s after the event), so finalizeSpool would never get to close
+    // its writers. Give it a deadline to stop draining by, then hold the
+    // process open (up to the deadline plus slack) so it can actually do so.
+    g_closeDeadline = GetTickCount64() + 3500;
+    if (!g_stop) {
+      g_stop = true;
+      if (g_client) g_client->cancel();
+      if (g_netTrace) g_netTrace->stop();
+    }
+    if (g_doneEvent) WaitForSingleObject(g_doneEvent, 4500);
+    return TRUE;
+  }
+  if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) {
     // First Ctrl-C: stop capturing, let the spool drain to the output files.
     // A later one only aborts the write if finalizeSpool is actually draining
     // right now; before that (teardown still running) it just acknowledges -
@@ -1242,6 +1262,7 @@ int run(int argc, wchar_t** argv);
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  g_doneEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   std::vector<wchar_t*> av(argv, argv + argc);
   // Elevated relaunch: hidden leading args from relaunchElevated - restore the
   // caller's working directory, honour --no-pause - then drop them so the rest
@@ -1271,6 +1292,7 @@ int wmain(int argc, wchar_t** argv) {
   }
 
   const int rc = run(static_cast<int>(av.size()), av.data());
+  if (g_doneEvent) SetEvent(g_doneEvent);
 
   std::fflush(stdout);
   if (elevatedChild && !g_noPause) pauseBeforeExit(rc);

@@ -32,6 +32,10 @@ extern std::atomic<bool> g_abortWrite;
 // True only while finalizeSpool is draining the spool into the output files;
 // gates whether a Ctrl-C should set g_abortWrite. Set/cleared by finalizeSpool.
 extern std::atomic<bool> g_writing;
+// GetTickCount64() deadline set when the console is closing (Windows kills the
+// process ~5 s later); the write stops early past it so files still get closed.
+// 0 = none.
+extern std::atomic<uint64_t> g_closeDeadline;
 
 void writeOut(const char* s, size_t n);
 void outf(const char* fmt, ...);        // console/file stream

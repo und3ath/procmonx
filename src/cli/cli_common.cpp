@@ -23,6 +23,7 @@ bool g_jsonStdout = false;
 bool g_noPause = false;
 std::atomic<bool> g_abortWrite{false};
 std::atomic<bool> g_writing{false};
+std::atomic<uint64_t> g_closeDeadline{0};
 
 void writeOut(const char* s, size_t n) {
   if (!g_silent) std::fwrite(s, 1, n, stdout);
@@ -423,6 +424,8 @@ int finalizeSpool(pmx::EventSpool& spool, const LiveOutputPaths& paths,
              (unsigned long long)total, pct);
       }
     }
+    if (!g_abortWrite && g_closeDeadline != 0 && GetTickCount64() >= g_closeDeadline)
+      g_abortWrite = true;
     return !writeErr && !g_abortWrite;
   });
   g_writing = false;
