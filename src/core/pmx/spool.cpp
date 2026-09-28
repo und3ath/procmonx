@@ -145,41 +145,128 @@ bool decodeAt(const std::string& buf, uint64_t offset, Event& e, uint8_t& tag) {
 }
 }  // namespace
 
-EventSpool::EventSpool(SpoolOptions opt) : opt_(std::move(opt)) {}
+EventSpool::EventSpool(SpoolOptions opt)
+    : opt_(std::move(opt)), halfBudget_(std::max<size_t>(opt_.bufferBytes / 2, 1)) {}
 
 EventSpool::~EventSpool() {
+  {
+    std::lock_guard<std::mutex> lk(mx_);
+    shutdown_ = true;
+  }
+  cv_.notify_all();
+  if (workerStarted_ && worker_.joinable()) worker_.join();
   for (auto& rf : runFiles_)
     if (rf.handle != INVALID_HANDLE_VALUE) CloseHandle(rf.handle);
 }
 
+uint64_t EventSpool::count() const { return count_; }
+
+size_t EventSpool::runs() const {
+  std::lock_guard<std::mutex> lk(mx_);
+  return runFiles_.size();
+}
+
+uint64_t EventSpool::spilledBytes() const {
+  std::lock_guard<std::mutex> lk(mx_);
+  return spilledBytes_;
+}
+
 std::error_code EventSpool::add(const Event& ev, uint8_t tag) {
+  {
+    std::lock_guard<std::mutex> lk(mx_);
+    if (stickyErr_) return stickyErr_;
+  }
+
   std::string rec;
   appendEventRecord(rec, ev);
   const uint32_t recLen = (uint32_t)(1 + rec.size());
+
+  Buffer* target = &buffers_[activeIdx_];
   // Spill before appending, into a buffer reserved once: letting the string
-  // double past the budget would peak near 2x the configured RAM.
-  const size_t after = buf_.size() + 4 + recLen + (keys_.size() + 1) * sizeof(Key);
-  if (!keys_.empty() && after > opt_.bufferBytes)
-    if (std::error_code ec = spill()) return ec;
-  if (buf_.capacity() < opt_.bufferBytes) buf_.reserve(opt_.bufferBytes);
-  const uint64_t offset = buf_.size();
-  buf_.append(reinterpret_cast<const char*>(&recLen), 4);
-  buf_.push_back(static_cast<char>(tag));
-  buf_.append(rec);
-  keys_.push_back({ev.timestamp, ev.sequence, offset});
+  // double past the budget would peak near 2x the configured per-buffer RAM.
+  const size_t after =
+      target->buf.size() + 4 + recLen + (target->keys.size() + 1) * sizeof(Key);
+  if (!target->keys.empty() && after > halfBudget_) {
+    if (std::error_code ec = handoff()) return ec;
+    target = &buffers_[activeIdx_];
+  }
+  if (target->buf.capacity() < halfBudget_) target->buf.reserve(halfBudget_);
+  const uint64_t offset = target->buf.size();
+  target->buf.append(reinterpret_cast<const char*>(&recLen), 4);
+  target->buf.push_back(static_cast<char>(tag));
+  target->buf.append(rec);
+  target->keys.push_back({ev.timestamp, ev.sequence, offset});
   ++count_;
   return {};
 }
 
-std::error_code EventSpool::spill() {
-  std::stable_sort(keys_.begin(), keys_.end(), [](const Key& a, const Key& b) {
-    return keyLess(a.ts, a.seq, b.ts, b.seq);
+std::error_code EventSpool::handoff() {
+  std::unique_lock<std::mutex> lk(mx_);
+  // Backpressure: at most one run write in flight - wait for it.
+  cv_.wait(lk, [&] { return !busy_; });
+  if (stickyErr_) return stickyErr_;
+
+  if (!workerStarted_) {
+    worker_ = std::thread(&EventSpool::workerMain, this);
+    workerStarted_ = true;
+  }
+
+  const int idx = activeIdx_;
+  const size_t runIndex = runFiles_.size();
+  const uint64_t eventsInRun = buffers_[idx].keys.size();
+  runFiles_.emplace_back();  // placeholder; worker fills it in on completion
+
+  busy_ = true;
+  workBufIdx_ = idx;
+  workRunIndex_ = runIndex;
+  workReady_ = true;
+  // The other buffer is idle: either never used, or the worker already
+  // finished with it and cleared it before clearing busy_ last time.
+  activeIdx_ = 1 - idx;
+  lk.unlock();
+  cv_.notify_all();
+
+  if (onSpill) onSpill(runIndex, eventsInRun);
+  return {};
+}
+
+void EventSpool::workerMain() {
+  std::unique_lock<std::mutex> lk(mx_);
+  for (;;) {
+    cv_.wait(lk, [&] { return workReady_ || shutdown_; });
+    if (!workReady_) return;  // shutdown_ and nothing queued
+    workReady_ = false;
+    const int idx = workBufIdx_;
+    const size_t runIndex = workRunIndex_;
+    lk.unlock();
+
+    SpillResult res;
+    std::error_code ec = spillBuffer(buffers_[idx], runIndex, res);
+
+    lk.lock();
+    if (ec) {
+      if (!stickyErr_) stickyErr_ = ec;
+    } else {
+      runFiles_[runIndex] = RunFile{res.handle, res.events};
+      spilledBytes_ += res.bytes;
+    }
+    buffers_[idx].buf.clear();
+    buffers_[idx].keys.clear();
+    busy_ = false;
+    cv_.notify_all();
+  }
+}
+
+std::error_code EventSpool::spillBuffer(Buffer& b, size_t runIndex,
+                                        SpillResult& out) const {
+  std::stable_sort(b.keys.begin(), b.keys.end(), [](const Key& a, const Key& c) {
+    return keyLess(a.ts, a.seq, c.ts, c.seq);
   });
 
   const std::wstring dir = opt_.dir.empty() ? defaultTempDir() : opt_.dir;
   wchar_t path[MAX_PATH];
   swprintf(path, MAX_PATH, L"%s\\pmx-spool-%lu-%zu.tmp", dir.c_str(),
-          GetCurrentProcessId(), runFiles_.size());
+          GetCurrentProcessId(), runIndex);
   HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                         CREATE_ALWAYS,
                         FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
@@ -189,11 +276,11 @@ std::error_code EventSpool::spill() {
   ChunkWriter w;
   w.open(h);
   uint64_t bytes = 0;
-  for (const Key& k : keys_) {
+  for (const Key& k : b.keys) {
     uint32_t recLen;
-    std::memcpy(&recLen, buf_.data() + k.offset, 4);
+    std::memcpy(&recLen, b.buf.data() + k.offset, 4);
     const size_t total = 4 + recLen;
-    if (std::error_code ec = w.write(buf_.data() + k.offset, total)) {
+    if (std::error_code ec = w.write(b.buf.data() + k.offset, total)) {
       CloseHandle(h);
       return ec;
     }
@@ -204,39 +291,49 @@ std::error_code EventSpool::spill() {
     return ec;
   }
 
-  const size_t idx = runFiles_.size();
-  const uint64_t eventsInRun = keys_.size();
-  runFiles_.push_back({h, eventsInRun});
-  spilledBytes_ += bytes;
-  buf_.clear();
-  keys_.clear();
-  if (onSpill) onSpill(idx, eventsInRun);
+  out.handle = h;
+  out.events = b.keys.size();
+  out.bytes = bytes;
   return {};
 }
 
 std::error_code EventSpool::drain(
     const std::function<bool(const Event&, uint8_t)>& sink) {
+  std::error_code spillErr;
+  {
+    std::unique_lock<std::mutex> lk(mx_);
+    cv_.wait(lk, [&] { return !busy_; });
+    spillErr = stickyErr_;
+  }
+  // A failed run is lost, but everything else is still delivered before the
+  // error is returned.
+  std::erase_if(runFiles_, [](const RunFile& rf) {
+    return rf.handle == INVALID_HANDLE_VALUE;
+  });
+
   auto byKey = [](const Key& a, const Key& b) {
     return keyLess(a.ts, a.seq, b.ts, b.seq);
   };
 
+  Buffer& tail = buffers_[activeIdx_];
+
   if (runFiles_.empty()) {
-    // Fast path: nothing ever spilled, sort and decode straight from buf_.
-    std::stable_sort(keys_.begin(), keys_.end(), byKey);
-    for (const Key& k : keys_) {
+    // Fast path: nothing ever spilled, sort and decode straight from tail.buf.
+    std::stable_sort(tail.keys.begin(), tail.keys.end(), byKey);
+    for (const Key& k : tail.keys) {
       Event e;
       uint8_t tag;
-      if (!decodeAt(buf_, k.offset, e, tag)) return errc(ERROR_INVALID_DATA);
-      if (!sink(e, tag)) return {};
+      if (!decodeAt(tail.buf, k.offset, e, tag)) return errc(ERROR_INVALID_DATA);
+      if (!sink(e, tag)) return spillErr;
     }
-    return {};
+    return spillErr;
   }
 
   // Sort the in-memory tail too; it merges in as the last (highest-index)
   // source, so equal (ts, seq) keys across sources still come out in arrival
   // order - earlier runs were spilled from earlier-arriving events, and each
   // run (and the tail) is itself stable-sorted.
-  std::stable_sort(keys_.begin(), keys_.end(), byKey);
+  std::stable_sort(tail.keys.begin(), tail.keys.end(), byKey);
 
   const size_t nRuns = runFiles_.size();
   std::vector<RunReader> readers(nRuns);
@@ -263,8 +360,8 @@ std::error_code EventSpool::drain(
     if (readers[i].loadNext()) heap.push({readers[i].ts, readers[i].seq, i});
   const size_t tailSrc = nRuns;
   size_t tailPos = 0;
-  if (tailPos < keys_.size())
-    heap.push({keys_[tailPos].ts, keys_[tailPos].seq, tailSrc});
+  if (tailPos < tail.keys.size())
+    heap.push({tail.keys[tailPos].ts, tail.keys[tailPos].seq, tailSrc});
 
   while (!heap.empty()) {
     const HeapItem top = heap.top();
@@ -272,12 +369,12 @@ std::error_code EventSpool::drain(
     Event e;
     uint8_t tag;
     if (top.src == tailSrc) {
-      if (!decodeAt(buf_, keys_[tailPos].offset, e, tag))
+      if (!decodeAt(tail.buf, tail.keys[tailPos].offset, e, tag))
         return errc(ERROR_INVALID_DATA);
       ++tailPos;
-      const bool more = tailPos < keys_.size();
-      if (!sink(e, tag)) return {};
-      if (more) heap.push({keys_[tailPos].ts, keys_[tailPos].seq, tailSrc});
+      const bool more = tailPos < tail.keys.size();
+      if (!sink(e, tag)) return spillErr;
+      if (more) heap.push({tail.keys[tailPos].ts, tail.keys[tailPos].seq, tailSrc});
     } else {
       RunReader& rr = readers[top.src];
       tag = static_cast<uint8_t>(rr.payload[0]);
@@ -286,10 +383,11 @@ std::error_code EventSpool::drain(
       if (!readEventRecord(rp, rend, kEventRecordVersion, e))
         return errc(ERROR_INVALID_DATA);
       const bool more = rr.loadNext();
-      if (!sink(e, tag)) return {};
+      if (!sink(e, tag)) return spillErr;
       if (more) heap.push({rr.ts, rr.seq, top.src});
     }
   }
+  if (spillErr) return spillErr;
   for (const RunReader& rr : readers)
     if (rr.failed) return errc(ERROR_READ_FAULT);
   return {};

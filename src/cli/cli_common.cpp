@@ -417,7 +417,7 @@ int finalizeSpool(pmx::EventSpool& spool, const LiveOutputPaths& paths,
   ULONGLONG lastTick = GetTickCount64();
   const bool showProgress = total >= 50000 || spool.runs() > 0;
   std::error_code writeErr;
-  spool.drain([&](const pmx::Event& ev, uint8_t tag) -> bool {
+  const std::error_code drainErr = spool.drain([&](const pmx::Event& ev, uint8_t tag) -> bool {
     const bool pass = (tag & 1) != 0;
     if ((pass || unfiltered) && paths.save && !writeErr) writeErr = pmxw.write(ev);
     if ((pass || unfiltered) && paths.pml && !writeErr) writeErr = pmlw.write(ev);
@@ -445,9 +445,14 @@ int finalizeSpool(pmx::EventSpool& spool, const LiveOutputPaths& paths,
     closeAll();
     return 5;
   }
-  if (g_abortWrite && written < total)
+  if (drainErr) {
+    printError("spool", drainErr);
+    errf("(output is incomplete: wrote %llu of %llu events)\n",
+         (unsigned long long)written, (unsigned long long)total);
+  } else if (g_abortWrite && written < total) {
     statusf("Stopped early: wrote %llu of %llu events\n",
            (unsigned long long)written, (unsigned long long)total);
+  }
 
   std::error_code closeErr;
   if (paths.save) {
@@ -474,7 +479,7 @@ int finalizeSpool(pmx::EventSpool& spool, const LiveOutputPaths& paths,
     printError("live output", closeErr);
     return 5;
   }
-  return 0;
+  return drainErr ? 5 : 0;
 }
 
 }  // namespace pmx::cli

@@ -172,5 +172,116 @@ int test_spool() {
     RemoveDirectoryW(dir.c_str());
   }
 
+  // 5) Background double-buffered spill under a tiny budget (forces frequent
+  // handoffs, including backpressure waits when the worker can't keep up):
+  // drained output must still equal a std::stable_sort of the arrival-order
+  // input, tags included.
+  {
+    constexpr int N = 8000;
+    SpoolOptions opt;
+    opt.bufferBytes = 2048;  // halfBudget_ ~1024: many runs, frequent handoffs
+    EventSpool sp(opt);
+    size_t spillCalls = 0;
+    sp.onSpill = [&](size_t, uint64_t) { ++spillCalls; };
+
+    struct In { uint32_t seq; uint64_t ts; int idx; uint8_t tag; };
+    std::vector<In> ins;
+    ins.reserve(N);
+    for (int i = 0; i < N; ++i) {
+      const In in{(uint32_t)(i % 37),
+                  (uint64_t)(((unsigned)i * 2654435761u) % 200), i,
+                  (uint8_t)(i & 1)};
+      ins.push_back(in);
+      CHECK(!sp.add(makeEvent(in.seq, in.ts, in.idx), in.tag));
+    }
+    CHECK(sp.runs() > 1);
+    CHECK(spillCalls == sp.runs());
+    CHECK(sp.count() == (uint64_t)N);
+
+    std::vector<In> expected = ins;
+    std::stable_sort(expected.begin(), expected.end(), [](const In& a, const In& b) {
+      if (a.ts != b.ts) return a.ts < b.ts;
+      return a.seq < b.seq;
+    });
+
+    std::vector<int> got;
+    std::vector<uint8_t> gotTags;
+    got.reserve(N);
+    gotTags.reserve(N);
+    std::error_code de = sp.drain([&](const Event& e, uint8_t tag) {
+      got.push_back((int)e.pid);
+      gotTags.push_back(tag);
+      return true;
+    });
+    CHECK(!de);
+    CHECK(got.size() == expected.size());
+    if (got.size() == expected.size()) {
+      for (size_t i = 0; i < got.size(); ++i) {
+        CHECK(got[i] == expected[i].idx);
+        CHECK(gotTags[i] == expected[i].tag);
+      }
+    }
+  }
+
+  // 6) add() error propagation: a spool dir that doesn't exist fails inside
+  // the background worker at the first handoff. The failure isn't lost - a
+  // later add() (once the worker has had a chance to fail) returns it, every
+  // add() after that keeps returning it, and drain() still delivers what it
+  // holds but returns the error.
+  {
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    SpoolOptions opt;
+    opt.bufferBytes = 4096;
+    opt.dir = std::wstring(tmp) + L"pmx_spool_test_missing_dir_xyz";
+    EventSpool sp(opt);
+
+    std::error_code firstErr;
+    for (int i = 0; i < 2000 && !firstErr; ++i)
+      firstErr = sp.add(makeEvent((uint32_t)i, (uint64_t)i, i), 0);
+    CHECK(!!firstErr);
+
+    std::error_code ec2 = sp.add(makeEvent(0, 0, 0), 0);
+    CHECK(ec2 == firstErr);
+
+    uint64_t delivered = 0;
+    std::error_code de = sp.drain([&](const Event&, uint8_t) {
+      ++delivered;
+      return true;
+    });
+    CHECK(de == firstErr);
+    CHECK(delivered > 0);  // the in-memory buffer isn't thrown away
+  }
+
+  // 7) Destructor with a spill still in flight (torn down right after a big
+  // batch of adds, before the worker could plausibly have caught up): no
+  // crash, and every run file is still cleaned up (FILE_FLAG_DELETE_ON_CLOSE).
+  {
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const std::wstring dir = std::wstring(tmp) + L"pmx_spool_test_inflight";
+    CreateDirectoryW(dir.c_str(), nullptr);
+
+    {
+      SpoolOptions opt;
+      opt.bufferBytes = 4096;
+      opt.dir = dir;
+      EventSpool sp(opt);
+      for (int i = 0; i < 4000; ++i)
+        CHECK(!sp.add(makeEvent((uint32_t)i, (uint64_t)i, i), 1));
+      CHECK(sp.runs() > 0);
+      // sp destroyed here - possibly while the worker is still writing the
+      // last run.
+    }
+
+    const std::wstring pattern =
+        dir + L"\\pmx-spool-" + std::to_wstring(GetCurrentProcessId()) + L"-*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    CHECK(h == INVALID_HANDLE_VALUE);
+    if (h != INVALID_HANDLE_VALUE) FindClose(h);
+    RemoveDirectoryW(dir.c_str());
+  }
+
   return g_failures - before;
 }
